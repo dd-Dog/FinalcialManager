@@ -56,6 +56,11 @@ def normalize_code(code: str) -> str:
     return cleaned.zfill(6)
 
 
+def infer_recommender(input_path: Path) -> str:
+    name = input_path.stem.strip()
+    return name or "未知推荐人"
+
+
 def _to_tx_symbol(code: str) -> str:
     if code.startswith("6"):
         return f"sh{code}"
@@ -170,8 +175,9 @@ def fetch_daily_quote(code: str, date: str) -> QuoteResult:
     )
 
 
-def load_input(path: str, output_dir: Path) -> pd.DataFrame:
+def load_input(path: str, output_dir: Path, load_all_cache: bool = True) -> pd.DataFrame:
     input_path = Path(path)
+    recommender = infer_recommender(input_path)
     if input_path.suffix.lower() == ".csv":
         input_df = pd.read_csv(path, dtype={"code": str})
         required_columns = {"date", "code"}
@@ -182,19 +188,28 @@ def load_input(path: str, output_dir: Path) -> pd.DataFrame:
             input_df["company_name"] = None
         if "theme" not in input_df.columns:
             input_df["theme"] = None
+        if "recommender" not in input_df.columns:
+            input_df["recommender"] = recommender
     else:
         parsed_df = parse_recommendation_text(path)
+        parsed_df["recommender"] = recommender
         append_recommendation_cache(parsed_df, output_dir)
-        input_df = load_recommendation_cache(output_dir / "recommendation_cache.csv")
+        if load_all_cache:
+            input_df = load_recommendation_cache(output_dir / "recommendation_cache.csv")
+        else:
+            input_df = parsed_df.copy()
 
     input_df["code"] = input_df["code"].map(normalize_code)
     input_df["date"] = pd.to_datetime(input_df["date"]).dt.strftime("%Y-%m-%d")
+    if "recommender" not in input_df.columns:
+        input_df["recommender"] = recommender
     return input_df
 
 
 def parse_recommendation_text(path: str) -> pd.DataFrame:
     text = Path(path).read_text(encoding="utf-8")
     date_pattern = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+    month_day_pattern = re.compile(r"(?<!\d)(\d{1,2})月(\d{1,2})日(?!\d)")
     recommendation_pattern = re.compile(
         r"【\s*(?P<company>.*?)\s+(?P<code>\d{6})\s*】"
     )
@@ -213,14 +228,17 @@ def parse_recommendation_text(path: str) -> pd.DataFrame:
         if date_match:
             year, month, day = date_match.groups()
             current_date = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        else:
+            md_match = month_day_pattern.search(line)
+            if md_match:
+                month, day = md_match.groups()
+                year = datetime.now().year
+                current_date = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
 
         matched_any = False
         for match in recommendation_pattern.finditer(line):
             if current_date is None:
-                raise ValueError(
-                    f"Found stock code {match.group('code')} before any date in source text. "
-                    "Please ensure each recommendation block includes a date line."
-                )
+                continue
             company_name = re.sub(r"\s+", "", match.group("company"))
             theme_match = theme_pattern.search(line)
             theme = theme_match.group("theme").strip() if theme_match else None
@@ -238,10 +256,7 @@ def parse_recommendation_text(path: str) -> pd.DataFrame:
         if not matched_any:
             for code in code_pattern.findall(line):
                 if current_date is None:
-                    raise ValueError(
-                        f"Found stock code {code} before any date in source text. "
-                        "Please ensure each recommendation block includes a date line."
-                    )
+                    continue
                 theme_match = theme_pattern.search(line)
                 theme = theme_match.group("theme").strip() if theme_match else None
                 rows.append(
@@ -269,13 +284,24 @@ def append_recommendation_cache(input_df: pd.DataFrame, output_dir: Path) -> Non
     new_df = input_df.copy()
     new_df["code"] = new_df["code"].map(normalize_code)
     new_df["date"] = pd.to_datetime(new_df["date"]).dt.strftime("%Y-%m-%d")
+    if "recommender" not in new_df.columns:
+        new_df["recommender"] = "未知推荐人"
+    new_df["recommender"] = new_df["recommender"].fillna("").astype(str).str.strip()
+    new_df.loc[new_df["recommender"] == "", "recommender"] = "未知推荐人"
 
     if cache_path.exists():
         cached_df = pd.read_csv(cache_path, dtype={"code": str})
     else:
-        cached_df = pd.DataFrame(columns=["date", "code", "company_name", "theme"])
+        cached_df = pd.DataFrame(
+            columns=["date", "code", "company_name", "theme", "recommender"]
+        )
+    if "recommender" not in cached_df.columns:
+        cached_df["recommender"] = "未知推荐人"
+    cached_df["recommender"] = cached_df["recommender"].fillna("").astype(str).str.strip()
+    cached_df.loc[cached_df["recommender"] == "", "recommender"] = "未知推荐人"
 
     merged = pd.concat([cached_df, new_df], ignore_index=True)
+    # Canonical recommendation key: one stock code per day.
     merged = merged.drop_duplicates(subset=["date", "code"], keep="last")
     merged = merged.sort_values(["date", "code"])
     merged.to_csv(cache_path, index=False, encoding="utf-8-sig")
@@ -284,15 +310,19 @@ def append_recommendation_cache(input_df: pd.DataFrame, output_dir: Path) -> Non
 
 def load_recommendation_cache(cache_path: Path) -> pd.DataFrame:
     if not cache_path.exists():
-        return pd.DataFrame(columns=["date", "code", "company_name", "theme"])
+        return pd.DataFrame(
+            columns=["date", "code", "company_name", "theme", "recommender"]
+        )
 
     rec_df = pd.read_csv(cache_path, dtype={"code": str})
-    for col in ["date", "code", "company_name", "theme"]:
+    for col in ["date", "code", "company_name", "theme", "recommender"]:
         if col not in rec_df.columns:
-            rec_df[col] = None
+            rec_df[col] = "未知推荐人" if col == "recommender" else None
+    rec_df["recommender"] = rec_df["recommender"].fillna("").astype(str).str.strip()
+    rec_df.loc[rec_df["recommender"] == "", "recommender"] = "未知推荐人"
     rec_df["code"] = rec_df["code"].map(normalize_code)
     rec_df["date"] = pd.to_datetime(rec_df["date"]).dt.strftime("%Y-%m-%d")
-    return rec_df[["date", "code", "company_name", "theme"]]
+    return rec_df[["date", "code", "company_name", "theme", "recommender"]]
 
 
 def load_quote_cache(cache_path: Path) -> pd.DataFrame:
@@ -301,6 +331,7 @@ def load_quote_cache(cache_path: Path) -> pd.DataFrame:
             columns=[
                 "date",
                 "code",
+                "recommender",
                 "stock_name",
                 "company_name",
                 "theme",
@@ -318,6 +349,7 @@ def load_quote_cache(cache_path: Path) -> pd.DataFrame:
     expected_cols = [
         "date",
         "code",
+        "recommender",
         "stock_name",
         "company_name",
         "theme",
@@ -332,12 +364,22 @@ def load_quote_cache(cache_path: Path) -> pd.DataFrame:
     for col in expected_cols:
         if col not in quote_cache.columns:
             quote_cache[col] = None
+    quote_cache["recommender"] = quote_cache["recommender"].fillna("").astype(str).str.strip()
+    quote_cache.loc[quote_cache["recommender"] == "", "recommender"] = "未知推荐人"
     return quote_cache[expected_cols]
 
 
 def save_quote_cache(cache_df: pd.DataFrame, cache_path: Path) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    dedup_df = cache_df.drop_duplicates(subset=["date", "code"], keep="last").sort_values(["date", "code"])
+    for col in ["date", "code", "recommender"]:
+        if col not in cache_df.columns:
+            cache_df[col] = None
+    cache_df["recommender"] = cache_df["recommender"].fillna("").astype(str).str.strip()
+    cache_df.loc[cache_df["recommender"] == "", "recommender"] = "未知推荐人"
+    # Quote cache follows recommendation canonical key: date + code.
+    dedup_df = cache_df.drop_duplicates(
+        subset=["date", "code"], keep="last"
+    ).sort_values(["date", "code"])
     dedup_df.to_csv(cache_path, index=False, encoding="utf-8-sig")
     print(f"Saved: {cache_path}")
 
@@ -355,19 +397,30 @@ def analyze(input_df: pd.DataFrame, quote_cache_path: Path) -> pd.DataFrame:
             how="left",
             suffixes=("", "_rec"),
         )
+        quote_cache_df["recommender"] = quote_cache_df["recommender"].where(
+            quote_cache_df["recommender"].notna(), quote_cache_df["recommender_rec"]
+        )
         quote_cache_df["company_name"] = quote_cache_df["company_name"].where(
             quote_cache_df["company_name"].notna(), quote_cache_df["company_name_rec"]
         )
         quote_cache_df["theme"] = quote_cache_df["theme"].where(
             quote_cache_df["theme"].notna(), quote_cache_df["theme_rec"]
         )
-        quote_cache_df = quote_cache_df.drop(columns=["company_name_rec", "theme_rec"])
+        quote_cache_df = quote_cache_df.drop(
+            columns=["recommender_rec", "company_name_rec", "theme_rec"]
+        )
 
     cache_lookup: Dict[tuple[str, str], Dict[str, object]] = {}
     for item in quote_cache_df.to_dict(orient="records"):
-        cache_lookup[(str(item["date"]), normalize_code(str(item["code"])))] = item
+        cache_lookup[
+            (
+                str(item["date"]),
+                normalize_code(str(item["code"])),
+            )
+        ] = item
 
     for rec in input_df.itertuples(index=False):
+        recommender = getattr(rec, "recommender", "未知推荐人") or "未知推荐人"
         cache_key = (rec.date, rec.code)
         cached_quote = cache_lookup.get(cache_key)
         input_stock_name = getattr(rec, "company_name", None)
@@ -418,6 +471,7 @@ def analyze(input_df: pd.DataFrame, quote_cache_path: Path) -> pd.DataFrame:
         row = {
             "date": quote.date,
             "code": quote.code,
+            "recommender": recommender,
             "stock_name": quote.stock_name or input_stock_name or (
                 str(cached_quote["stock_name"]) if cached_quote and pd.notna(cached_quote["stock_name"]) else None
             ),
@@ -453,8 +507,10 @@ def analyze(input_df: pd.DataFrame, quote_cache_path: Path) -> pd.DataFrame:
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    save_quote_cache(pd.DataFrame(cache_lookup.values()), quote_cache_path)
-    return pd.DataFrame(rows)
+    rows_df = pd.DataFrame(rows)
+    merged_cache_df = pd.concat([quote_cache_df, rows_df], ignore_index=True)
+    save_quote_cache(merged_cache_df, quote_cache_path)
+    return rows_df
 
 
 def build_daily_summary(detail_df: pd.DataFrame) -> pd.DataFrame:

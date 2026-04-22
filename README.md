@@ -28,6 +28,7 @@ pip install -r requirements.txt
   - 日期行示例：`今天是2026年4月21日`
   - 股票行示例：`【飞龙股份 002536】`
   - 会自动提取关键信息：`date`、`code`、`company_name`、`theme`
+  - 会自动从文件名提取推荐人（如 `张少辉.txt` -> `recommender=张少辉`）
   - 会自动提取 6 位股票代码并绑定到最近一次出现的日期
 
 示例见 `sample_input.csv` 与 `sample_data.txt`。
@@ -38,12 +39,43 @@ pip install -r requirements.txt
 python financial_manager.py --input sample_input.csv --output-dir output
 ```
 
+## 增量更新命令（不重启整套流程）
+
+当看板已经在运行时，可单独执行下面命令追加新数据到缓存：
+
+```bash
+python append_data.py --input 张少辉.txt --output-dir output
+```
+
+该命令只更新：
+
+- `output/recommendation_cache.csv`
+- `output/quote_cache.csv`
+
+不会重新跑整套统计导出流程，适合日常快速追加。
+每次执行会自动检查 `recommendation_cache.csv` 与 `quote_cache.csv` 的键覆盖关系，
+将 `quote_cache` 中缺失的推荐记录自动补齐（按 `date+code` 对齐）。
+
+## 看板功能（功能二）
+
+生成缓存数据后，可以启动可视化看板：
+
+```bash
+streamlit run dashboard.py
+```
+
+看板支持：
+
+- 按推荐人筛选。
+- 菜单切换日期，查看“当日推荐股票涨跌幅”柱状图。
+- 选择统计区间（最近7天、最近30天、自定义），查看区间平均涨跌幅和每日平均明细。
+
 ## 输出文件
 
 运行后会在 `output` 目录生成：
 
 - `recommendation_cache.csv`：历史推荐缓存（按 `date+code` 去重，长期累积），由源文本自动解析写入。
-- `quote_cache.csv`：核心历史数据表（`date+code` 去重），整合推荐信息与行情信息，包含 `theme`、开收盘、收益率、持仓收益等字段。
+- `quote_cache.csv`：核心历史数据表（按 `date+code` 去重），整合推荐信息与行情信息，包含 `recommender`、`theme`、开收盘、收益率、持仓收益等字段。
 
 并在 `output/charts` 目录生成图表：
 

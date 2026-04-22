@@ -1,3 +1,4 @@
 pandas
 akshare
 matplotlib
+streamlit
