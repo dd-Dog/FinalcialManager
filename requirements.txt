@@ -1,4 +1,14 @@
 pandas
 akshare
 matplotlib
-streamlit
+streamlit>=1.40.1
+python-dotenv
+fastapi
+uvicorn
+sqlalchemy
+alembic
+psycopg[binary]
+pydantic-settings
+python-jose[cryptography]
+bcrypt>=4.0.1
+pytest

@@ -1,0 +1,4 @@
+# 隐藏右上角开发者菜单项（含 Clear cache、Rerun 等），避免误触单键 C 等与复制混淆。
+# 开发时若需要清缓存，可临时改为 "auto" 或 "developer"，或用菜单刷新浏览器。
+[client]
+toolbarMode = "viewer"
