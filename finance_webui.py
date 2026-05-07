@@ -167,6 +167,27 @@ def load_dotenv_if_present() -> None:
         pass
 
 
+def _fm_env_file() -> Path:
+    return Path(__file__).resolve().parent / ".env"
+
+
+def read_fm_api_base_raw() -> str:
+    """优先读项目根 .env 文件中的 FM_API_BASE（每次脚本重跑都读盘），避免会话里长期卡住旧公网地址。"""
+    env_path = _fm_env_file()
+    raw = ""
+    try:
+        from dotenv import dotenv_values
+
+        if env_path.is_file():
+            vals = dotenv_values(env_path)
+            raw = (vals.get("FM_API_BASE") or vals.get("API_BASE") or "").strip()
+    except ImportError:
+        pass
+    if not raw:
+        raw = (os.getenv("FM_API_BASE") or os.getenv("API_BASE") or "").strip()
+    return raw
+
+
 MENU_PAGES: list[tuple[str, str]] = [
     ("overview", "nav_overview"),
     ("accounts", "nav_accounts"),
@@ -636,7 +657,10 @@ def inject_login_page_css() -> None:
             section[data-testid="stMain"] form button[type="submit"],
             section[data-testid="stMain"] form [data-baseweb="button"] {
                 background: linear-gradient(92deg, #0284c7, #4f46e5) !important;
+                -webkit-background-clip: border-box !important;
+                background-clip: border-box !important;
                 color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
                 border: 1px solid rgba(125, 211, 252, 0.55) !important;
                 font-size: 1.08rem !important;
                 font-weight: 600 !important;
@@ -648,7 +672,10 @@ def inject_login_page_css() -> None:
             section[data-testid="stMain"] form button[type="submit"]:hover,
             section[data-testid="stMain"] form [data-baseweb="button"]:hover {
                 background: linear-gradient(92deg, #0ea5e9, #6366f1) !important;
+                -webkit-background-clip: border-box !important;
+                background-clip: border-box !important;
                 color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
                 border-color: #e0f2fe !important;
                 box-shadow: 0 12px 32px rgba(14, 165, 233, 0.42) !important;
                 filter: none !important;
@@ -658,7 +685,14 @@ def inject_login_page_css() -> None:
             section[data-testid="stMain"] form button[type="submit"]:hover *,
             section[data-testid="stMain"] form [data-baseweb="button"]:hover * {
                 color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
                 opacity: 1 !important;
+            }
+            section[data-testid="stMain"] form .stButton > button:hover [data-baseweb="typography"],
+            section[data-testid="stMain"] form button[type="submit"]:hover [data-baseweb="typography"],
+            section[data-testid="stMain"] form [data-baseweb="button"]:hover [data-baseweb="typography"] {
+                color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
             }
             section[data-testid="stMain"] form .stButton > button:focus-visible,
             section[data-testid="stMain"] form button[type="submit"]:focus-visible,
@@ -673,6 +707,7 @@ def inject_login_page_css() -> None:
             section[data-testid="stMain"] form [data-baseweb="button"] p,
             section[data-testid="stMain"] form [data-baseweb="button"] span {
                 color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
             }
 
             /* 登录页说明文字（st.caption） */
@@ -781,6 +816,18 @@ def inject_login_page_css() -> None:
             section[data-testid="stMain"] div[data-testid="element-container"][class*="st-key-_fm_ui_english_toggle"] [data-testid="stVerticalBlock"],
             section[data-testid="stMain"] div[data-testid="element-container"][class*="st-key-fm_lang_toggle_btn"] [data-testid="stVerticalBlock"] {
                 gap: 0.35rem !important;
+            }
+            /* 登录失败等 st.error：深色背景下必须可见（否则像「点了没反应」） */
+            section[data-testid="stMain"] [data-testid="stAlert"],
+            section[data-testid="stMain"] div[data-testid="stAlert"] {
+                margin-top: 1rem !important;
+            }
+            section[data-testid="stMain"] [data-testid="stAlert"] p,
+            section[data-testid="stMain"] [data-testid="stAlert"] span,
+            section[data-testid="stMain"] div[data-testid="stAlert"] p,
+            section[data-testid="stMain"] div[data-testid="stAlert"] span {
+                color: #fecaca !important;
+                -webkit-text-fill-color: #fecaca !important;
             }
             /* 更旧 Streamlit 若仍用 baseweb switch */
             section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has([data-baseweb="switch"]) [data-testid="stWidgetLabel"],
@@ -1050,6 +1097,54 @@ def inject_app_css() -> None:
     )
 
 
+def inject_login_form_button_css_tail() -> None:
+    """放在登录表单之后注入，覆盖 Streamlit 主题在悬停时写入的样式（含透明字/渐变裁切）。"""
+    st.markdown(
+        """
+        <style>
+            section[data-testid="stMain"] form button {
+                -webkit-background-clip: border-box !important;
+                background-clip: border-box !important;
+                color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
+            }
+            section[data-testid="stMain"] form button:hover,
+            section[data-testid="stMain"] form button:focus,
+            section[data-testid="stMain"] form button:focus-visible {
+                -webkit-background-clip: border-box !important;
+                background-clip: border-box !important;
+                color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
+            }
+            section[data-testid="stMain"] form button *,
+            section[data-testid="stMain"] form button:hover *,
+            section[data-testid="stMain"] form button:focus *,
+            section[data-testid="stMain"] form button:focus-visible * {
+                color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
+                -webkit-background-clip: border-box !important;
+                background-clip: border-box !important;
+            }
+            section[data-testid="stMain"] form [data-testid^="stBaseButton"],
+            section[data-testid="stMain"] form [data-testid^="stBaseButton"]:hover,
+            section[data-testid="stMain"] form [data-testid^="stBaseButton"]:hover * {
+                color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
+                -webkit-background-clip: border-box !important;
+                background-clip: border-box !important;
+            }
+            section[data-testid="stMain"] form button[kind="formSubmit"],
+            section[data-testid="stMain"] form button[kind="formSubmit"]:hover,
+            section[data-testid="stMain"] form button[kind="formSubmit"]:hover * {
+                color: #ffffff !important;
+                -webkit-text-fill-color: #ffffff !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_login_screen() -> None:
     inject_login_page_css()
     render_language_switcher()
@@ -1070,30 +1165,33 @@ def render_login_screen() -> None:
             username = st.text_input(t("username"), key="login_username")
             password = st.text_input(t("password"), type="password", key="login_password")
             submitted = st.form_submit_button(t("login_submit"), use_container_width=True)
-        if submitted:
-            ok, result = api_call(
-                "POST",
-                "/auth/login",
-                payload={"username": username, "password": password},
-                require_auth=False,
-            )
-            if ok and isinstance(result, dict):
-                data = result.get("data", {})
-                token = data.get("access_token")
-                if token:
-                    st.session_state["token"] = token
-                    st.session_state["username"] = username
-                    st.session_state["nav_page"] = "overview"
-                    st.session_state.pop("bank_catalog", None)
-                    st.session_state.pop("_bank_catalog_load_attempted", None)
-                    for _dk in (*SESSION_DLG_KEYS, *SESSION_TX_DETAIL_KEYS):
-                        st.session_state.pop(_dk, None)
-                    _persist_auth_cookie(str(token), str(username))
-                    st.rerun()
+            # 须在 form 内处理提交（官方示例）；放在外侧易导致提交后逻辑不执行或状态异常
+            if submitted:
+                ok, result = api_call(
+                    "POST",
+                    "/auth/login",
+                    payload={"username": username, "password": password},
+                    require_auth=False,
+                )
+                if ok and isinstance(result, dict):
+                    data = result.get("data", {})
+                    token = data.get("access_token")
+                    if token:
+                        st.session_state["token"] = token
+                        st.session_state["username"] = username
+                        st.session_state["nav_page"] = "overview"
+                        st.session_state.pop("bank_catalog", None)
+                        st.session_state.pop("_bank_catalog_load_attempted", None)
+                        for _dk in (*SESSION_DLG_KEYS, *SESSION_TX_DETAIL_KEYS):
+                            st.session_state.pop(_dk, None)
+                        _persist_auth_cookie(str(token), str(username))
+                        st.rerun()
+                    else:
+                        st.error(t("err_no_token"))
                 else:
-                    st.error(t("err_no_token"))
-            else:
-                st.error(result)
+                    st.error(result)
+
+        inject_login_form_button_css_tail()
 
 
 def render_sidebar_nav() -> str:
@@ -2180,10 +2278,7 @@ def main() -> None:
     if "ui_lang" not in st.session_state:
         st.session_state["ui_lang"] = "zh"
     load_dotenv_if_present()
-
-    if "api_base" not in st.session_state:
-        env_raw = os.getenv("FM_API_BASE") or os.getenv("API_BASE") or ""
-        st.session_state["api_base"] = normalize_api_base(env_raw)
+    st.session_state["api_base"] = normalize_api_base(read_fm_api_base_raw())
 
     _restore_auth_cookie_if_needed()
 

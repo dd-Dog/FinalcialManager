@@ -1,0 +1,28 @@
+# 安装前：将下文所有 /opt/FinancialManager 改为你的项目根目录；
+# 将 User/Group 改为与 API 单元一致。
+# After= 里的 *.service 须与「API 单元文件名」一致（若改名为 financial-manager-api.service 则改这一行）。
+# 同机调 API 时 .env 中建议：FM_API_BASE=http://127.0.0.1:8123/api/v1（端口与 API 一致）
+#
+# sudo cp fm-webui.service /etc/systemd/system/
+# sudo systemctl daemon-reload
+# sudo systemctl enable --now fm-webui.service
+
+[Unit]
+Description=Financial Manager Streamlit UI
+After=network-online.target fm-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/FinancialManager
+EnvironmentFile=/opt/FinancialManager/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+ExecStart=/opt/FinancialManager/.venv/bin/streamlit run finance_webui.py --server.address=127.0.0.1 --server.port=8501 --server.headless=true
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
