@@ -174,6 +174,30 @@ def run_smoke(base: str, user_prefix: str, password: str) -> dict[str, dict]:
     )
     results["transfer"] = pack_response(response)
 
+    response = requests.post(
+        f"{base}/assets",
+        headers=headers,
+        json={"asset_type": "fund", "symbol": "OPN001", "name": "opening-only", "market": "CN"},
+        timeout=10,
+    )
+    results["create_asset_opening_only"] = pack_response(response)
+    opening_asset_id = response.json()["data"]["id"]
+
+    response = requests.post(
+        f"{base}/positions/opening",
+        headers=headers,
+        json={
+            "asset_id": opening_asset_id,
+            "account_id": alipay_account_id,
+            "quantity": "1234.567890",
+            "avg_cost": "2.345678",
+            "realized_pnl": "10.00",
+            "replace_existing": False,
+        },
+        timeout=10,
+    )
+    results["positions_opening_bootstrap"] = pack_response(response)
+
     response = requests.get(f"{base}/positions", headers=headers, timeout=10)
     results["positions"] = pack_response(response)
 
@@ -202,12 +226,21 @@ def run_smoke(base: str, user_prefix: str, password: str) -> dict[str, dict]:
         "expected_realized_pnl": None,
     }
     try:
-        pos = results["positions"]["body"]["data"]["items"][0]
-        checkpoints["expected_position_qty"] = pos.get("quantity") == "70.00"
-        checkpoints["expected_realized_pnl"] = pos.get("realized_pnl") == "297.00"
+        items = results["positions"]["body"]["data"]["items"]
+        pos_519 = next((p for p in items if p.get("symbol") == "600519"), None)
+        checkpoints["expected_position_qty"] = bool(pos_519 and pos_519.get("quantity") == "70.00")
+        checkpoints["expected_realized_pnl"] = bool(pos_519 and pos_519.get("realized_pnl") == "297.00")
+        pos_opn = next((p for p in items if p.get("symbol") == "OPN001"), None)
+        checkpoints["opening_bootstrap_ok"] = bool(
+            pos_opn
+            and pos_opn.get("quantity") == "1234.57"
+            and pos_opn.get("avg_cost") == "2.35"
+            and pos_opn.get("realized_pnl") == "10.00"
+        )
     except Exception:
         checkpoints["expected_position_qty"] = False
         checkpoints["expected_realized_pnl"] = False
+        checkpoints["opening_bootstrap_ok"] = False
     results["checkpoints"] = checkpoints
 
     return results

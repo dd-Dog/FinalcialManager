@@ -210,6 +210,8 @@ SESSION_DLG_KEYS = (
     "dlg_asset_pick_id",
     "dlg_asset_edit_id",
     "dlg_asset_delete_id",
+    "dlg_pos_open",
+    "dlg_pos_edit_open",
 )
 
 _FM_ACCOUNTS_GRID_KEY = "fm_accounts_grid"
@@ -279,6 +281,23 @@ def _dismiss_dialog_delete_asset() -> None:
     _request_clear_fm_assets_grid()
 
 
+def _dismiss_dialog_pos_opening() -> None:
+    st.session_state.pop("dlg_pos_open", None)
+
+
+def _dismiss_dialog_pos_edit() -> None:
+    st.session_state.pop("dlg_pos_edit_open", None)
+    for _k in (
+        "dlg_pos_edit_asset_pick",
+        "dlg_ep_qty",
+        "dlg_ep_ac",
+        "dlg_ep_rp",
+        "dlg_pos_edit_account_pick",
+        "dlg_pos_edit_replace",
+    ):
+        st.session_state.pop(_k, None)
+
+
 SESSION_TX_DETAIL_KEYS = ("dlg_tx_detail_id",)
 
 
@@ -293,30 +312,104 @@ def _dismiss_dialog_transaction_detail() -> None:
 
 
 TX_LIST_PAGE_SIZE = 10
+ASSETS_LIST_PAGE_SIZE = 20
+POSITIONS_HOLDINGS_PAGE_SIZE = 10
 
 # 登录态 Cookie：整页刷新会新建 Streamlit 会话，用主页面 Cookie + ``st.context.cookies`` 恢复 token。
 # （extra_streamlit_components 写在 iframe 里的 cookie 往往不会出现在主文档请求里，故不用。）
+#
+# 生产环境若刷新仍回登录，常见原因：① 反代未把浏览器 Cookie 传到 Streamlit（须转发 Cookie 头）；
+# ② 应用挂在子路径下须设置 ``FM_AUTH_COOKIE_PATH`` 与浏览器访问路径前缀一致；③ 跨站嵌入需
+# ``FM_AUTH_COOKIE_SAMESITE=none``（仅 HTTPS，且自动带 Secure）。
 _AUTH_COOKIE = "fm_auth"
 
 
+def _auth_cookie_path() -> str:
+    """``Set-Cookie`` 的 Path，须与用户在浏览器地址栏里的路径前缀一致（子路径部署时必配）。"""
+    raw = (os.getenv("FM_AUTH_COOKIE_PATH") or "/").strip()
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    if len(raw) > 1 and raw.endswith("/"):
+        raw = raw.rstrip("/")
+    return raw or "/"
+
+
+def _auth_cookie_samesite_attr() -> str:
+    """返回 ``Lax`` / ``Strict`` / ``None``（大小写按浏览器要求）。"""
+    v = (os.getenv("FM_AUTH_COOKIE_SAMESITE") or "Lax").strip().lower()
+    if v == "none":
+        return "None"
+    if v == "strict":
+        return "Strict"
+    return "Lax"
+
+
 def _persist_auth_cookie(token: str, username: str) -> None:
-    """在主页面 ``document.cookie`` 写入，刷新后由浏览器随请求带给 ``st.context.cookies``。"""
+    """写入浏览器 Cookie，刷新后由 ``st.context.cookies`` 恢复。
+
+    Streamlit 的 ``components.html`` 常在 iframe 中执行，仅写 ``parent.document`` 在部分环境下会静默失败，
+    导致刷新后无 Cookie；故对 ``document``、``window.top`` / ``parent`` 均尝试写入（同源下至少一处成功即可）。
+    """
     payload = json.dumps({"token": token, "username": username}, separators=(",", ":"))
     js_payload = json.dumps(payload)
+    path_lit = json.dumps(_auth_cookie_path())
+    same_site = _auth_cookie_samesite_attr()
+    ss_lit = json.dumps(same_site)
     html = f"""
-<div style="height:1px;width:1px"></div>
+<div style="height:1px;width:1px;overflow:hidden"></div>
 <script>
 (function () {{
   const raw = {js_payload};
-  const part = "{_AUTH_COOKIE}=" + encodeURIComponent(raw) + "; Path=/; Max-Age=1209600; SameSite=Lax";
+  const cookiePath = {path_lit};
+  const sameSite = {ss_lit};
+  var secure = "";
   try {{
-    var d = window.parent && window.parent !== window ? window.parent.document : document;
-    d.cookie = part;
-  }} catch (e) {{}}
+    if (sameSite === "None") {{
+      secure = "; Secure";
+    }} else if (window.location && window.location.protocol === "https:") {{
+      secure = "; Secure";
+    }}
+  }} catch (e0) {{}}
+  const part = "{_AUTH_COOKIE}=" + encodeURIComponent(raw) + "; Path=" + cookiePath + "; Max-Age=1209600; SameSite=" + sameSite + secure;
+  const apply = function (doc) {{
+    try {{ doc.cookie = part; return true; }} catch (e) {{ return false; }}
+  }};
+  apply(document);
+  try {{
+    if (window.top && window.top !== window) {{ apply(window.top.document); }}
+  }} catch (e1) {{}}
+  try {{
+    if (window.parent && window.parent !== window && window.parent !== window.top) {{
+      apply(window.parent.document);
+    }}
+  }} catch (e2) {{}}
 }})();
 </script>
 """
     components.html(html, height=1, width=1)
+
+
+def _fm_auth_cookie_raw(cookies_obj: object) -> str | None:
+    """从 ``st.context.cookies`` 取出 ``fm_auth`` 值（兼容大小写差异）。"""
+    if cookies_obj is None:
+        return None
+    try:
+        g = getattr(cookies_obj, "get", None)
+        if callable(g):
+            raw = g(_AUTH_COOKIE)
+            if raw:
+                return str(raw).strip()
+    except Exception:
+        pass
+    try:
+        td = getattr(cookies_obj, "to_dict", None)
+        if callable(td):
+            for k, v in td().items():
+                if str(k).lower() == _AUTH_COOKIE.lower() and v:
+                    return str(v).strip()
+    except Exception:
+        pass
+    return None
 
 
 def _restore_auth_cookie_if_needed() -> None:
@@ -325,7 +418,7 @@ def _restore_auth_cookie_if_needed() -> None:
     raw: str | None = None
     if hasattr(st, "context"):
         try:
-            raw = st.context.cookies.get(_AUTH_COOKIE)
+            raw = _fm_auth_cookie_raw(st.context.cookies)
         except Exception:
             raw = None
     if not raw:
@@ -349,14 +442,36 @@ def _restore_auth_cookie_if_needed() -> None:
 
 
 def _clear_auth_cookie() -> None:
+    path_lit = json.dumps(_auth_cookie_path())
+    same_site = _auth_cookie_samesite_attr()
+    ss_lit = json.dumps(same_site)
     html = f"""
-<div style="height:1px;width:1px"></div>
+<div style="height:1px;width:1px;overflow:hidden"></div>
 <script>
 (function () {{
+  const cookiePath = {path_lit};
+  const sameSite = {ss_lit};
+  var secure = "";
   try {{
-    var d = window.parent && window.parent !== window ? window.parent.document : document;
-    d.cookie = "{_AUTH_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax";
-  }} catch (e) {{}}
+    if (sameSite === "None") {{
+      secure = "; Secure";
+    }} else if (window.location && window.location.protocol === "https:") {{
+      secure = "; Secure";
+    }}
+  }} catch (e0) {{}}
+  const part = "{_AUTH_COOKIE}=; Path=" + cookiePath + "; Max-Age=0; SameSite=" + sameSite + secure;
+  const apply = function (doc) {{
+    try {{ doc.cookie = part; }} catch (e) {{}}
+  }};
+  apply(document);
+  try {{
+    if (window.top && window.top !== window) {{ apply(window.top.document); }}
+  }} catch (e1) {{}}
+  try {{
+    if (window.parent && window.parent !== window && window.parent !== window.top) {{
+      apply(window.parent.document);
+    }}
+  }} catch (e2) {{}}
 }})();
 </script>
 """
@@ -462,6 +577,26 @@ def _friendly_delete_error(result: object, *, kind: str) -> str:
     if "related transactions" in dl:
         return t("err_delete_asset_tx")
     return t("err_delete_asset_generic")
+
+
+def _friendly_pos_opening_error(result: object) -> str:
+    """POST /positions/opening 失败时的可读说明。"""
+    raw = (result if isinstance(result, str) else str(result) if result is not None else "").strip()
+    if not raw:
+        return t("err_pos_opening_generic")
+    detail = raw.split(": ", 1)[-1].strip() if ": " in raw else raw
+    dl = detail.lower()
+    if "replace_existing" in dl or "existing position" in dl:
+        return t("err_pos_replace_required")
+    if "buy/sell history" in dl or "replace_existing=true to change quantity" in dl:
+        return t("err_pos_patch_replace_required")
+    if "position not found" in dl:
+        return t("err_pos_not_found")
+    if "asset not found" in dl:
+        return t("err_pos_asset_not_found")
+    if "account not found" in dl:
+        return t("err_pos_account_not_found")
+    return t("err_pos_opening_generic")
 
 
 def _fetch_api_dict(
@@ -1303,6 +1438,7 @@ def render_login_screen() -> None:
                             *SESSION_PENDING_GRID_CLEAR_KEYS,
                         ):
                             st.session_state.pop(_dk, None)
+                        st.session_state.pop("pos_holdings_page", None)
                         _persist_auth_cookie(str(token), str(username))
                         st.rerun()
                     else:
@@ -1356,6 +1492,7 @@ def render_sidebar_nav() -> str:
             *SESSION_TX_DETAIL_KEYS,
             *SESSION_GRID_KEYS,
             *SESSION_PENDING_GRID_CLEAR_KEYS,
+            "pos_holdings_page",
         ):
             st.session_state.pop(k, None)
         st.rerun()
@@ -2332,11 +2469,20 @@ def render_overview_panel() -> None:
         st.info(t("info_no_accounts"))
 
     st.subheader(t("sub_positions"))
-    pos = data.get("positions") or []
-    if pos:
-        st.dataframe(prepare_grid_rows(pos), use_container_width=True, hide_index=True)
-    else:
-        st.info(t("info_no_positions"))
+    st.caption(t("overview_positions_hint"))
+    c_fund, c_stock = st.columns(2)
+    with c_fund:
+        st.metric(t("metric_fund_book_total"), data.get("fund_book_value_total", "0.00"))
+    with c_stock:
+        st.metric(t("metric_stock_book_total"), data.get("stock_book_value_total", "0.00"))
+    try:
+        from decimal import Decimal
+
+        other_s = str(data.get("other_book_value_total", "0.00") or "0.00").replace(",", "")
+        if Decimal(other_s) > Decimal("0.005"):
+            st.metric(t("metric_other_book_total"), data.get("other_book_value_total", "0.00"))
+    except (ArithmeticError, ValueError, TypeError):
+        pass
 
     st.caption(t("cap_overview_hint"))
 
@@ -2348,7 +2494,11 @@ def _render_pnl_overview_body(data: dict) -> None:
     st.subheader(t("sub_by_symbol"))
     positions = data.get("positions") or []
     if positions:
-        st.dataframe(prepare_grid_rows(positions), use_container_width=True, hide_index=True)
+        st.dataframe(
+            prepare_grid_rows(positions, drop_keys=frozenset({"account_id", "asset_id"})),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
         st.info(t("info_no_pos_data"))
 
@@ -2471,22 +2621,51 @@ def render_assets_panel() -> None:
 
     ok, result = api_call("GET", "/assets")
     if ok and isinstance(result, dict):
-        items = result.get("data", {}).get("items", [])
+        items = result.get("data", {}).get("items", []) or []
         st.subheader(t("sub_asset_list"))
+        page_size = ASSETS_LIST_PAGE_SIZE
+        page_req = max(1, int(st.session_state.get("assets_list_page", 1) or 1))
+        n = len(items)
+        total_pages = max(1, (n + page_size - 1) // page_size) if n else 1
+        page = min(page_req, total_pages)
+        if page_req > total_pages:
+            st.session_state["assets_list_page"] = total_pages
+            st.rerun()
+        prev_pg = int(st.session_state.get("_fm_assets_list_page", page) or page)
+        if prev_pg != page:
+            _clear_fm_grid_selection(_FM_ASSETS_GRID_KEY)
+        st.session_state["_fm_assets_list_page"] = page
+
         if items:
-            _consume_assets_grid_row_pick(items)
+            p1, p2, p3 = st.columns([1, 2, 1])
+            with p1:
+                if st.button(t("tx_page_prev"), disabled=page <= 1, key="ast_list_prev"):
+                    st.session_state["assets_list_page"] = page - 1
+                    st.rerun()
+            with p2:
+                st.caption(t("tx_page_status", page=page, total_pages=total_pages, total=n))
+            with p3:
+                if st.button(t("tx_page_next"), disabled=page >= total_pages, key="ast_list_next"):
+                    st.session_state["assets_list_page"] = page + 1
+                    st.rerun()
+
+            start = (page - 1) * page_size
+            page_items = items[start : start + page_size]
+            _consume_assets_grid_row_pick(page_items)
             ast_df = pd.DataFrame(
-                prepare_grid_rows(items, drop_keys=frozenset({"has_open_position"})),
+                prepare_grid_rows(page_items, drop_keys=frozenset({"has_open_position"})),
             )
             st.dataframe(
                 ast_df,
                 use_container_width=True,
                 hide_index=True,
+                height="content",
                 on_select="rerun",
                 selection_mode="single-row",
                 key=_FM_ASSETS_GRID_KEY,
             )
         else:
+            st.session_state["assets_list_page"] = 1
             st.info(t("info_no_assets"))
     else:
         st.error(result)
@@ -2781,15 +2960,405 @@ def render_transfers_panel() -> None:
                     st.rerun()
 
 
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_pos_opening)
+def _dialog_opening_position() -> None:
+    st.subheader(t("pos_dlg_opening_title"))
+    st.caption(t("pos_dlg_help"))
+    if st.button(t("dlg_close"), key="dlg_pos_close"):
+        st.session_state.pop("dlg_pos_open", None)
+        st.rerun()
+
+    accounts = fetch_accounts()
+    if not accounts:
+        st.warning(t("warn_create_account_first"))
+        return
+    assets = fetch_assets()
+    if not assets:
+        st.warning(t("warn_create_asset_first"))
+        return
+
+    def _dec_str(v: object) -> str:
+        from decimal import Decimal, InvalidOperation
+
+        try:
+            d = Decimal(str(v))
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValueError("bad")
+        s = format(d, "f").rstrip("0").rstrip(".")
+        return s or "0"
+
+    with st.form("dlg_pos_opening_form"):
+        acc_opts = {
+            _account_pick_label(a): int(a["id"])
+            for a in sorted(accounts, key=lambda x: int(x.get("id") or 0), reverse=True)
+        }
+        acc_lab = st.selectbox(
+            t("pos_dlg_cash_account"),
+            options=list(acc_opts.keys()),
+            label_visibility="visible",
+            key="dlg_pos_account_pick",
+        )
+        cid = acc_opts[acc_lab]
+        label_to_id: dict[str, int] = {}
+        for a in sorted(assets, key=lambda x: int(x.get("id") or 0), reverse=True):
+            label = f"{a['id']} · {a.get('symbol', '')} {a.get('name', '')} ({a.get('asset_type', '')})"
+            label_to_id[label] = int(a["id"])
+        pick = st.selectbox(
+            t("pos_dlg_asset"),
+            options=list(label_to_id.keys()),
+            label_visibility="visible",
+            key="dlg_pos_asset_pick",
+        )
+        aid = label_to_id[pick]
+        qty_v = st.number_input(
+            t("pos_dlg_qty"),
+            min_value=0.0,
+            value=100.0,
+            step=1e-6,
+            format="%.6f",
+            key="dlg_pos_qty",
+        )
+        cost_v = st.number_input(
+            t("pos_dlg_avg_cost"),
+            min_value=0.0,
+            value=1.0,
+            step=1e-6,
+            format="%.6f",
+            key="dlg_pos_avg_cost",
+        )
+        st.number_input(
+            t("pos_dlg_realized"),
+            min_value=-1e12,
+            value=0.0,
+            step=0.01,
+            format="%.2f",
+            key="dlg_pos_realized",
+        )
+        st.checkbox(t("pos_dlg_replace"), key="dlg_pos_replace")
+        submitted = st.form_submit_button(t("pos_dlg_save"))
+
+    if not submitted:
+        return
+    try:
+        q_s = _dec_str(qty_v)
+        a_s = _dec_str(cost_v)
+        r_s = _dec_str(st.session_state.get("dlg_pos_realized", 0.0))
+        from decimal import Decimal
+
+        if Decimal(q_s) <= 0 or Decimal(a_s) <= 0:
+            st.error(t("err_pos_qty_cost"))
+            return
+    except ValueError:
+        st.error(t("err_pos_qty_cost"))
+        return
+
+    ok, result = api_call(
+        "POST",
+        "/positions/opening",
+        payload={
+            "asset_id": aid,
+            "account_id": cid,
+            "quantity": q_s,
+            "avg_cost": a_s,
+            "realized_pnl": r_s,
+            "replace_existing": bool(st.session_state.get("dlg_pos_replace", False)),
+        },
+    )
+    if ok:
+        st.success(t("pos_ok_saved"))
+        st.session_state.pop("dlg_pos_open", None)
+        st.rerun()
+    st.error(_friendly_pos_opening_error(result))
+    return
+
+
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_pos_edit)
+def _dialog_edit_position() -> None:
+    st.subheader(t("pos_dlg_edit_title"))
+    st.caption(t("pos_dlg_help"))
+    if st.button(t("dlg_close"), key="dlg_pos_edit_close"):
+        _dismiss_dialog_pos_edit()
+        st.rerun()
+
+    accounts = fetch_accounts()
+    if not accounts:
+        st.warning(t("warn_create_account_first"))
+        return
+
+    ok, result = api_call("GET", "/positions")
+    if not ok or not isinstance(result, dict):
+        st.error(result if isinstance(result, str) else t("err_pos_opening_generic"))
+        return
+    items: list[dict] = result.get("data", {}).get("items") or []
+    if not items:
+        st.info(t("info_no_positions_simple"))
+        return
+
+    acc_opts = {
+        _account_pick_label(a): int(a["id"])
+        for a in sorted(accounts, key=lambda x: int(x.get("id") or 0), reverse=True)
+    }
+    acc_keys = list(acc_opts.keys())
+    ids = [int(i["asset_id"]) for i in items]
+
+    def _pos_row_label(aid: int) -> str:
+        row = next(x for x in items if int(x["asset_id"]) == aid)
+        sym = str(row.get("symbol") or "")
+        nm = str(row.get("name") or "")
+        return f"{aid} · {sym} {nm}"
+
+    def _sync_pos_edit_fields() -> None:
+        aid = int(st.session_state["dlg_pos_edit_asset_pick"])
+        row = next(x for x in items if int(x["asset_id"]) == aid)
+        st.session_state["dlg_ep_qty"] = float(row["quantity"])
+        st.session_state["dlg_ep_ac"] = float(row["avg_cost"])
+        rac = row.get("account_id")
+        if rac is not None:
+            pick_lbl = next((lb for lb, iid in acc_opts.items() if iid == int(rac)), None)
+            if pick_lbl is not None:
+                st.session_state["dlg_pos_edit_account_pick"] = pick_lbl
+        if "dlg_pos_edit_account_pick" not in st.session_state:
+            st.session_state["dlg_pos_edit_account_pick"] = acc_keys[0]
+
+    if st.session_state.get("dlg_pos_edit_asset_pick") not in ids:
+        st.session_state["dlg_pos_edit_asset_pick"] = ids[0]
+    if "dlg_ep_qty" not in st.session_state:
+        _sync_pos_edit_fields()
+
+    st.selectbox(
+        t("pos_dlg_pick_position"),
+        options=ids,
+        format_func=_pos_row_label,
+        key="dlg_pos_edit_asset_pick",
+        on_change=_sync_pos_edit_fields,
+    )
+
+    def _dec_str(v: object) -> str:
+        from decimal import Decimal, InvalidOperation
+
+        try:
+            d = Decimal(str(v))
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValueError("bad")
+        s = format(d, "f").rstrip("0").rstrip(".")
+        return s or "0"
+
+    with st.form("dlg_pos_edit_form"):
+        st.number_input(
+            t("pos_dlg_qty"),
+            min_value=0.0,
+            step=1e-6,
+            format="%.6f",
+            key="dlg_ep_qty",
+        )
+        st.number_input(
+            t("pos_dlg_avg_cost"),
+            min_value=0.0,
+            step=1e-6,
+            format="%.6f",
+            key="dlg_ep_ac",
+        )
+        st.selectbox(
+            t("pos_dlg_cash_account"),
+            options=acc_keys,
+            key="dlg_pos_edit_account_pick",
+        )
+        st.checkbox(t("pos_dlg_replace"), key="dlg_pos_edit_replace")
+        submitted = st.form_submit_button(t("dlg_save"))
+
+    if not submitted:
+        return
+
+    aid = int(st.session_state.get("dlg_pos_edit_asset_pick") or ids[0])
+    acc_lab = st.session_state.get("dlg_pos_edit_account_pick")
+    if not isinstance(acc_lab, str) or acc_lab not in acc_opts:
+        st.error(t("err_pos_account_not_found"))
+        return
+    cid = acc_opts[acc_lab]
+
+    row_cur = next((x for x in items if int(x["asset_id"]) == aid), None)
+    if row_cur is None:
+        st.error(t("err_pos_not_found"))
+        return
+
+    try:
+        q_s = _dec_str(st.session_state.get("dlg_ep_qty", 0))
+        a_s = _dec_str(st.session_state.get("dlg_ep_ac", 0))
+        r_s = _dec_str(row_cur.get("realized_pnl", 0))
+        from decimal import Decimal
+
+        if Decimal(q_s) <= 0 or Decimal(a_s) <= 0:
+            st.error(t("err_pos_qty_cost"))
+            return
+    except ValueError:
+        st.error(t("err_pos_qty_cost"))
+        return
+
+    rep = bool(st.session_state.get("dlg_pos_edit_replace", False))
+    params = {"replace_existing": "true"} if rep else None
+    ok2, res2 = api_call(
+        "PATCH",
+        f"/positions/by-asset/{aid}",
+        payload={
+            "account_id": int(cid),
+            "quantity": q_s,
+            "avg_cost": a_s,
+            "realized_pnl": r_s,
+        },
+        params=params,
+    )
+    if ok2:
+        st.success(t("pos_ok_updated"))
+        _dismiss_dialog_pos_edit()
+        st.rerun()
+    st.error(_friendly_pos_opening_error(res2))
+    return
+
+
+def _holdings_book_by_type_dict(data: dict, holdings: list[dict]) -> dict[str, str]:
+    """在持账面成本（数量×成本）按 fund / stock / other 汇总；优先用接口字段，旧接口则从 ``holdings`` 推算。"""
+    hbt = data.get("holdings_book_by_type")
+    if isinstance(hbt, dict) and "fund" in hbt and "stock" in hbt:
+        return {
+            "fund": str(hbt.get("fund", "0.00")),
+            "stock": str(hbt.get("stock", "0.00")),
+            "other": str(hbt.get("other", "0.00")),
+        }
+    from decimal import Decimal
+
+    f = s = o = Decimal(0)
+    for r in holdings:
+        try:
+            cv = Decimal(str(r.get("cost_amount") or "0").replace(",", ""))
+        except (ArithmeticError, ValueError, TypeError):
+            cv = Decimal(0)
+        at = str(r.get("asset_type") or "").strip().lower()
+        if at == "fund":
+            f += cv
+        elif at == "stock":
+            s += cv
+        else:
+            o += cv
+
+    def q(v: Decimal) -> str:
+        return f"{v.quantize(Decimal('0.01')):.2f}"
+
+    return {"fund": q(f), "stock": q(s), "other": q(o)}
+
+
 def render_positions_panel() -> None:
-    st.header(t("positions_title"))
+    if st.session_state.get("dlg_pos_edit_open"):
+        _dialog_edit_position()
+    elif st.session_state.get("dlg_pos_open"):
+        _dialog_opening_position()
+
+    _title_col, _btn_col = st.columns([0.68, 0.32], gap="small", vertical_alignment="center")
+    with _title_col:
+        st.markdown(
+            f'<p style="margin:0;padding:0"><span class="fm-toolbar-page-title">{html.escape(t("positions_title"))}</span></p>',
+            unsafe_allow_html=True,
+        )
+    with _btn_col:
+        b0, b1 = st.columns(2, gap="small")
+        with b0:
+            if st.button(t("pos_btn_opening"), key="fm_pos_opening"):
+                st.session_state.pop("dlg_pos_edit_open", None)
+                st.session_state["dlg_pos_open"] = True
+                st.rerun()
+        with b1:
+            if st.button(t("pos_btn_edit"), key="fm_pos_edit"):
+                st.session_state.pop("dlg_pos_open", None)
+                st.session_state["dlg_pos_edit_open"] = True
+                st.rerun()
+
     ok, result = api_call("GET", "/positions")
     if ok and isinstance(result, dict):
-        items = result.get("data", {}).get("items", [])
-        if items:
-            st.dataframe(prepare_grid_rows(items), use_container_width=True, hide_index=True)
-        else:
+        data = result.get("data", {}) or {}
+        items_all = data.get("items") or []
+        recent_sells = data.get("recent_sells")
+        if recent_sells is None:
+            recent_sells = []
+
+        holdings = data.get("holdings")
+        if holdings is None:
+            holdings = []
+            for row in items_all:
+                try:
+                    q = float(row.get("quantity") or 0)
+                except (TypeError, ValueError):
+                    q = 0.0
+                if abs(q) > 1e-8:
+                    d = {k: v for k, v in row.items() if k != "realized_pnl"}
+                    d.setdefault("last_price", None)
+                    d.setdefault("floating_pnl", None)
+                    holdings.append(d)
+
+        if not holdings and not recent_sells and not items_all:
             st.info(t("info_no_positions_simple"))
+        else:
+            hsum = _holdings_book_by_type_dict(data, holdings)
+            sum_line = t("pos_hold_type_totals", fund=hsum["fund"], stock=hsum["stock"])
+            try:
+                from decimal import Decimal
+
+                if Decimal(str(hsum.get("other", "0.00")).replace(",", "")) > Decimal("0.005"):
+                    sum_line += t("pos_hold_type_other_suffix", other=hsum["other"])
+            except (ArithmeticError, ValueError, TypeError):
+                pass
+            _ttl = html.escape(t("pos_sub_holding"))
+            _sum = html.escape(sum_line)
+            st.markdown(
+                f'<div style="display:flex;flex-wrap:wrap;align-items:baseline;column-gap:0.75rem;row-gap:0.25rem;'
+                f'margin:0 0 0.35rem 0;">'
+                f'<span style="font-size:1.35rem;font-weight:600;color:#0f172a;line-height:1.25;">{_ttl}</span>'
+                f'<span style="font-size:0.98rem;font-weight:500;color:#475569;line-height:1.35;">{_sum}</span>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            if holdings:
+                st.caption(t("pos_cap_hold_quote_hint"))
+                ph_size = POSITIONS_HOLDINGS_PAGE_SIZE
+                n_h = len(holdings)
+                total_pages = max(1, (n_h + ph_size - 1) // ph_size) if n_h else 1
+                page_req = max(1, int(st.session_state.get("pos_holdings_page", 1) or 1))
+                page = min(page_req, total_pages)
+                if page_req > total_pages:
+                    st.session_state["pos_holdings_page"] = total_pages
+                    st.rerun()
+
+                p1, p2, p3 = st.columns([1, 2, 1])
+                with p1:
+                    if st.button(t("tx_page_prev"), disabled=page <= 1, key="pos_holdings_prev"):
+                        st.session_state["pos_holdings_page"] = page - 1
+                        st.rerun()
+                with p2:
+                    st.caption(t("tx_page_status", page=page, total_pages=total_pages, total=n_h))
+                with p3:
+                    if st.button(t("tx_page_next"), disabled=page >= total_pages, key="pos_holdings_next"):
+                        st.session_state["pos_holdings_page"] = page + 1
+                        st.rerun()
+
+                start = (page - 1) * ph_size
+                page_holdings = holdings[start : start + ph_size]
+                st.dataframe(
+                    prepare_grid_rows(page_holdings, drop_keys=frozenset({"account_id", "asset_id"})),
+                    use_container_width=True,
+                    hide_index=True,
+                    height="content",
+                )
+            else:
+                st.session_state["pos_holdings_page"] = 1
+                st.caption(t("info_no_holdings_sub"))
+            st.subheader(t("pos_sub_recent_sells"))
+            if recent_sells:
+                st.caption(t("pos_cap_recent_sells_hint"))
+                st.dataframe(
+                    prepare_grid_rows(recent_sells),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption(t("info_no_recent_sells"))
     else:
         st.error(result)
 

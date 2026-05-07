@@ -29,31 +29,28 @@ def wealth_overview(
     cash_total = Decimal(cash_total or 0)
 
     rows = db.execute(
-        select(Position, Asset)
+        select(Position, Asset, Account)
         .join(Asset, Position.asset_id == Asset.id)
+        .outerjoin(Account, Position.account_id == Account.id)
         .where(Position.user_id == current_user.id, Asset.user_id == current_user.id)
         .order_by(Asset.asset_type, Asset.symbol)
     ).all()
 
-    pos_items: list[dict] = []
-    book = Decimal(0)
-    for position, asset in rows:
+    fund_book = Decimal(0)
+    stock_book = Decimal(0)
+    other_book = Decimal(0)
+    for position, asset, cust in rows:
         qty = Decimal(position.quantity)
         ac = Decimal(position.avg_cost)
         bv = qty * ac
-        book += bv
-        pos_items.append(
-            {
-                "asset_id": asset.id,
-                "asset_type": asset.asset_type,
-                "symbol": asset.symbol,
-                "name": asset.name,
-                "quantity": dec2(qty),
-                "avg_cost": dec2(ac),
-                "book_value": dec2(bv),
-                "realized_pnl": dec2(position.realized_pnl),
-            }
-        )
+        at = (asset.asset_type or "").strip().lower()
+        if at == "fund":
+            fund_book += bv
+        elif at == "stock":
+            stock_book += bv
+        else:
+            other_book += bv
+    book = fund_book + stock_book + other_book
 
     accounts_out = [
         {
@@ -76,9 +73,11 @@ def wealth_overview(
         data={
             "cash_total": dec2(cash_total),
             "position_book_value_total": dec2(book),
+            "fund_book_value_total": dec2(fund_book),
+            "stock_book_value_total": dec2(stock_book),
+            "other_book_value_total": dec2(other_book),
             "grand_book_total": dec2(grand),
             "accounts": accounts_out,
-            "positions": pos_items,
             "note": "合计为各账户余额 + 持仓数量×成本；未含证券盯市涨跌。",
         }
     )
@@ -124,22 +123,27 @@ def pnl_overview(
     pos_total = Decimal(pos_total or 0)
 
     pos_rows = db.execute(
-        select(Position, Asset)
+        select(Position, Asset, Account)
         .join(Asset, Position.asset_id == Asset.id)
+        .outerjoin(Account, Position.account_id == Account.id)
         .where(Position.user_id == current_user.id, Asset.user_id == current_user.id)
         .order_by(Asset.symbol)
     ).all()
-    positions = [
-        {
-            "symbol": asset.symbol,
-            "name": asset.name,
-            "asset_type": asset.asset_type,
-            "quantity": dec2(position.quantity),
-            "avg_cost": dec2(position.avg_cost),
-            "realized_pnl": dec2(position.realized_pnl),
-        }
-        for position, asset in pos_rows
-    ]
+    positions = []
+    for position, asset, cust in pos_rows:
+        cash_lbl = f"{cust.name} ({cust.account_type})" if cust is not None else None
+        positions.append(
+            {
+                "cash_account": cash_lbl,
+                "symbol": asset.symbol,
+                "name": asset.name,
+                "asset_type": asset.asset_type,
+                "account_id": position.account_id,
+                "quantity": dec2(position.quantity),
+                "avg_cost": dec2(position.avg_cost),
+                "realized_pnl": dec2(position.realized_pnl),
+            }
+        )
 
     sell_rows = db.execute(
         select(Transaction, Asset)

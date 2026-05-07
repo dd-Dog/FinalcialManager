@@ -196,6 +196,7 @@ def create_transaction(
             position = Position(
                 user_id=current_user.id,
                 asset_id=asset.id,
+                account_id=payload.account_id if payload.type == "buy" else None,
                 quantity=Decimal("0"),
                 avg_cost=Decimal("0"),
                 realized_pnl=Decimal("0"),
@@ -207,6 +208,8 @@ def create_transaction(
         current_avg_cost = Decimal(position.avg_cost)
         current_realized = Decimal(position.realized_pnl)
         if payload.type == "buy":
+            if payload.account_id is not None:
+                position.account_id = payload.account_id
             new_qty = current_qty + quantity
             total_cost = current_qty * current_avg_cost + quantity * price
             position.quantity = new_qty

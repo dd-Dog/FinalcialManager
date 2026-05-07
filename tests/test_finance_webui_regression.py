@@ -25,6 +25,8 @@ def test_dismiss_callbacks_and_consumers_exist() -> None:
         "_dismiss_dialog_asset_pick",
         "_dismiss_dialog_edit_asset",
         "_dismiss_dialog_delete_asset",
+        "_dismiss_dialog_pos_opening",
+        "_dismiss_dialog_pos_edit",
         "_dismiss_dialog_new_transaction",
         "_dismiss_dialog_transaction_detail",
         "_consume_accounts_grid_row_pick",
@@ -58,6 +60,8 @@ def test_session_dlg_keys_include_row_pick_and_delete() -> None:
     assert "dlg_account_delete_id" in keys
     assert "dlg_asset_pick_id" in keys
     assert "dlg_asset_delete_id" in keys
+    assert "dlg_pos_open" in keys
+    assert "dlg_pos_edit_open" in keys
 
 
 def test_friendly_delete_error_returns_user_strings() -> None:
@@ -80,3 +84,13 @@ def test_column_label_single_language() -> None:
     en = cl.column_label("balance")
     assert zh == "余额" and en == "Balance"
     assert " / " not in zh and " / " not in en
+    st.session_state["ui_lang"] = "zh"
+    assert cl.column_label("cost_amount") == "成本金额"
+    st.session_state["ui_lang"] = "en"
+    assert cl.column_label("cost_amount") == "Cost amount"
+    st.session_state["ui_lang"] = "zh"
+    assert cl.column_label("floating_pnl") == "浮动盈亏"
+    assert cl.column_label("last_price") == "参考市价"
+    st.session_state["ui_lang"] = "en"
+    assert cl.column_label("floating_pnl") == "Floating P&L"
+    assert cl.column_label("last_price") == "Last price (ref.)"

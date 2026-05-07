@@ -85,6 +85,7 @@ class Position(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), nullable=False)
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), nullable=True)
     quantity: Mapped[float] = mapped_column(Numeric(18, 6), default=0, nullable=False)
     avg_cost: Mapped[float] = mapped_column(Numeric(18, 6), default=0, nullable=False)
     realized_pnl: Mapped[float] = mapped_column(Numeric(18, 2), default=0, nullable=False)
