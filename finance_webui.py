@@ -14,6 +14,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
+from cn_security_lookup import LOOKUP_BAD_INPUT, LOOKUP_NETWORK, LOOKUP_NOT_FOUND, lookup_cn_security
 from finance_column_labels import apply_table_column_labels
 from finance_i18n import account_type_label, asset_type_label, t, tx_type_label
 
@@ -121,7 +122,7 @@ def prepare_grid_rows(
     drop_keys: frozenset[str] | None = None,
     preserve_column_keys: frozenset[str] | None = None,
 ) -> list[dict]:
-    """时间列易读 + 表头双语（English / 中文）。``drop_keys`` 在转表头前剔除列；``preserve_column_keys`` 不改为双语键名。"""
+    """时间列易读 + 表头随界面语言。``drop_keys`` 在转表头前剔除列；``preserve_column_keys`` 不改为显示列名。"""
     data = rows
     if drop_keys:
         data = [{k: v for k, v in r.items() if k not in drop_keys} for r in rows]
@@ -199,8 +200,97 @@ MENU_PAGES: list[tuple[str, str]] = [
     ("reports", "nav_reports"),
 ]
 
-SESSION_DLG_KEYS = ("dlg_account_open", "dlg_asset_open", "dlg_tx_open")
+SESSION_DLG_KEYS = (
+    "dlg_account_open",
+    "dlg_asset_open",
+    "dlg_tx_open",
+    "dlg_account_pick_id",
+    "dlg_account_edit_id",
+    "dlg_account_delete_id",
+    "dlg_asset_pick_id",
+    "dlg_asset_edit_id",
+    "dlg_asset_delete_id",
+)
+
+_FM_ACCOUNTS_GRID_KEY = "fm_accounts_grid"
+_FM_ASSETS_GRID_KEY = "fm_assets_grid"
+
+SESSION_GRID_KEYS = (_FM_ACCOUNTS_GRID_KEY, _FM_ASSETS_GRID_KEY)
+
+_PENDING_CLEAR_FM_ACCOUNTS_GRID = "_pending_clear_fm_accounts_grid"
+_PENDING_CLEAR_FM_ASSETS_GRID = "_pending_clear_fm_assets_grid"
+
+SESSION_PENDING_GRID_CLEAR_KEYS = (_PENDING_CLEAR_FM_ACCOUNTS_GRID, _PENDING_CLEAR_FM_ASSETS_GRID)
+
+
+def _clear_fm_grid_selection(widget_key: str) -> None:
+    st.session_state[widget_key] = {"selection": {"rows": [], "columns": [], "cells": []}}
+
+
+def _request_clear_fm_accounts_grid() -> None:
+    """从 ``@st.dialog`` 内调用：勿直接改 ``fm_accounts_grid`` 的 session_state（对话框片段重跑时主表 widget 已存在会报错）。"""
+    st.session_state[_PENDING_CLEAR_FM_ACCOUNTS_GRID] = True
+
+
+def _request_clear_fm_assets_grid() -> None:
+    st.session_state[_PENDING_CLEAR_FM_ASSETS_GRID] = True
+
+
+def _dismiss_dialog_new_account() -> None:
+    st.session_state.pop("dlg_account_open", None)
+    _request_clear_fm_accounts_grid()
+
+
+def _dismiss_dialog_account_pick() -> None:
+    st.session_state.pop("dlg_account_pick_id", None)
+    _request_clear_fm_accounts_grid()
+
+
+def _dismiss_dialog_delete_account() -> None:
+    st.session_state.pop("dlg_account_delete_id", None)
+    _request_clear_fm_accounts_grid()
+
+
+def _dismiss_dialog_edit_account() -> None:
+    st.session_state.pop("dlg_account_edit_id", None)
+    _request_clear_fm_accounts_grid()
+
+
+def _dismiss_dialog_new_asset() -> None:
+    st.session_state.pop("dlg_asset_open", None)
+    st.session_state.pop("_dlg_ast_post_lookup", None)
+    for _k in ("dlg_ast_symbol", "dlg_ast_name", "dlg_ast_market"):
+        st.session_state.pop(_k, None)
+    _request_clear_fm_assets_grid()
+
+
+def _dismiss_dialog_asset_pick() -> None:
+    st.session_state.pop("dlg_asset_pick_id", None)
+    _request_clear_fm_assets_grid()
+
+
+def _dismiss_dialog_edit_asset() -> None:
+    st.session_state.pop("dlg_asset_edit_id", None)
+    _request_clear_fm_assets_grid()
+
+
+def _dismiss_dialog_delete_asset() -> None:
+    st.session_state.pop("dlg_asset_delete_id", None)
+    _request_clear_fm_assets_grid()
+
+
 SESSION_TX_DETAIL_KEYS = ("dlg_tx_detail_id",)
+
+
+def _dismiss_dialog_new_transaction() -> None:
+    st.session_state.pop("dlg_tx_open", None)
+
+
+def _dismiss_dialog_transaction_detail() -> None:
+    for k in SESSION_TX_DETAIL_KEYS:
+        st.session_state.pop(k, None)
+    _clear_fm_tx_list_df_selection()
+
 
 TX_LIST_PAGE_SIZE = 10
 
@@ -348,6 +438,30 @@ def api_call(
             detail = str(body)
         return False, f"{response.status_code}: {detail}"
     return True, body
+
+
+def _friendly_delete_error(result: object, *, kind: str) -> str:
+    """DELETE 账户/标的失败时：不把原始 HTTP 堆栈甩给用户，只给可读说明。"""
+    raw = (result if isinstance(result, str) else str(result) if result is not None else "").strip()
+    if not raw:
+        return t("err_delete_unknown")
+    detail = raw.split(": ", 1)[-1].strip() if ": " in raw else raw
+    dl = detail.lower()
+
+    if kind == "account":
+        if "non-zero balance" in dl:
+            return t("err_delete_account_balance")
+        if "related transactions" in dl:
+            return t("err_delete_account_tx")
+        if "related transfers" in dl:
+            return t("err_delete_account_transfer")
+        return t("err_delete_account_generic")
+
+    if "non-zero position" in dl or ("holding" in dl and "position" in dl):
+        return t("err_delete_asset_position")
+    if "related transactions" in dl:
+        return t("err_delete_asset_tx")
+    return t("err_delete_asset_generic")
 
 
 def _fetch_api_dict(
@@ -989,7 +1103,7 @@ def inject_app_css() -> None:
                 margin-top: 0 !important;
                 margin-bottom: 0 !important;
             }
-            /* 顶栏操作按钮：不要铺满整列（避免「新增资产」巨块） */
+            /* 顶栏操作按钮：不要铺满整列（避免「新增标的」巨块） */
             section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.fm-toolbar-page-title) .stButton > button {
                 width: auto !important;
                 max-width: 100% !important;
@@ -1182,7 +1296,12 @@ def render_login_screen() -> None:
                         st.session_state["nav_page"] = "overview"
                         st.session_state.pop("bank_catalog", None)
                         st.session_state.pop("_bank_catalog_load_attempted", None)
-                        for _dk in (*SESSION_DLG_KEYS, *SESSION_TX_DETAIL_KEYS):
+                        for _dk in (
+                            *SESSION_DLG_KEYS,
+                            *SESSION_TX_DETAIL_KEYS,
+                            *SESSION_GRID_KEYS,
+                            *SESSION_PENDING_GRID_CLEAR_KEYS,
+                        ):
                             st.session_state.pop(_dk, None)
                         _persist_auth_cookie(str(token), str(username))
                         st.rerun()
@@ -1212,7 +1331,12 @@ def render_sidebar_nav() -> str:
             use_container_width=True,
             type="primary" if is_active else "secondary",
         ):
-            for _dk in (*SESSION_DLG_KEYS, *SESSION_TX_DETAIL_KEYS):
+            for _dk in (
+                *SESSION_DLG_KEYS,
+                *SESSION_TX_DETAIL_KEYS,
+                *SESSION_GRID_KEYS,
+                *SESSION_PENDING_GRID_CLEAR_KEYS,
+            ):
                 st.session_state.pop(_dk, None)
             st.session_state["nav_page"] = page_key
             st.rerun()
@@ -1230,6 +1354,8 @@ def render_sidebar_nav() -> str:
             "_bank_catalog_load_attempted",
             *SESSION_DLG_KEYS,
             *SESSION_TX_DETAIL_KEYS,
+            *SESSION_GRID_KEYS,
+            *SESSION_PENDING_GRID_CLEAR_KEYS,
         ):
             st.session_state.pop(k, None)
         st.rerun()
@@ -1248,7 +1374,7 @@ def _form_field_row(label: str):
     return rc
 
 
-@st.dialog(" ", width="large")
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_new_account)
 def _dialog_new_account() -> None:
     st.subheader(t("dlg_new_account"))
     if "bank_catalog" not in st.session_state:
@@ -1376,17 +1502,216 @@ def _dialog_new_account() -> None:
             st.rerun()
 
 
-@st.dialog(" ", width="large")
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_account_pick)
+def _dialog_account_pick_actions() -> None:
+    """列表行选后：修改 / 删除。"""
+    raw_id = st.session_state.get("dlg_account_pick_id")
+    if raw_id is None:
+        return
+    aid = int(raw_id)
+
+    st.subheader(t("dlg_row_actions_title"))
+    if st.button(t("dlg_close"), key=f"dlg_acc_pick_close_{aid}"):
+        st.session_state.pop("dlg_account_pick_id", None)
+        _request_clear_fm_accounts_grid()
+        st.rerun()
+
+    items = fetch_accounts()
+    acc = next((a for a in items if int(a.get("id") or 0) == aid), None)
+    if not acc:
+        st.error(t("err_account_not_found"))
+        if st.button(t("dlg_close"), key=f"dlg_acc_pick_nf_{aid}"):
+            st.session_state.pop("dlg_account_pick_id", None)
+            _request_clear_fm_accounts_grid()
+            st.rerun()
+        return
+
+    st.markdown(html.escape(_account_pick_label(acc)))
+    c0, c1 = st.columns(2)
+    with c0:
+        if st.button(t("btn_edit_account"), key=f"dlg_acc_pick_edit_{aid}", use_container_width=True):
+            st.session_state.pop("dlg_account_pick_id", None)
+            st.session_state["dlg_account_edit_id"] = aid
+            _request_clear_fm_accounts_grid()
+            st.rerun()
+    with c1:
+        if st.button(t("btn_delete_account"), key=f"dlg_acc_pick_del_{aid}", use_container_width=True):
+            st.session_state.pop("dlg_account_pick_id", None)
+            st.session_state["dlg_account_delete_id"] = aid
+            _request_clear_fm_accounts_grid()
+            st.rerun()
+
+
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_delete_account)
+def _dialog_delete_account() -> None:
+    raw_id = st.session_state.get("dlg_account_delete_id")
+    if raw_id is None:
+        return
+    aid = int(raw_id)
+
+    if st.button(t("dlg_close"), key=f"dlg_dacc_close_{aid}"):
+        st.session_state.pop("dlg_account_delete_id", None)
+        _request_clear_fm_accounts_grid()
+        st.rerun()
+
+    items = fetch_accounts()
+    acc = next((a for a in items if int(a.get("id") or 0) == aid), None)
+    if not acc:
+        st.error(t("err_account_not_found"))
+        return
+
+    st.subheader(t("dlg_delete_account"))
+    st.markdown(html.escape(_fmt_account_brief(acc)))
+
+    confirm = st.checkbox(t("dlg_delete_account_confirm"), key=f"dlg_dacc_confirm_{aid}")
+    if st.button(t("dlg_delete_account_submit"), key=f"dlg_dacc_go_{aid}", disabled=not confirm):
+        ok, result = api_call("DELETE", f"/accounts/{aid}")
+        if ok:
+            st.success(t("msg_delete_ok"))
+        else:
+            st.error(_friendly_delete_error(result, kind="account"))
+        if ok:
+            st.session_state.pop("dlg_account_delete_id", None)
+            _request_clear_fm_accounts_grid()
+            st.rerun()
+
+
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_edit_account)
+def _dialog_edit_account() -> None:
+    raw_id = st.session_state.get("dlg_account_edit_id")
+    if raw_id is None:
+        return
+    aid = int(raw_id)
+
+    st.subheader(t("dlg_edit_account"))
+    b0, b1 = st.columns([0.5, 0.5])
+    with b0:
+        if st.button(t("dlg_close"), key=f"dlg_eacc_close_{aid}"):
+            st.session_state.pop("dlg_account_edit_id", None)
+            _request_clear_fm_accounts_grid()
+            st.rerun()
+    with b1:
+        if st.button(t("dlg_reload_catalog"), key=f"dlg_eacc_reload_{aid}"):
+            st.session_state.pop("_bank_catalog_load_attempted", None)
+            sync_bank_catalog_to_session()
+            st.rerun()
+
+    items = fetch_accounts()
+    acc = next((a for a in items if int(a.get("id") or 0) == aid), None)
+    if not acc:
+        st.error(t("err_account_not_found"))
+        if st.button(t("dlg_close"), key=f"dlg_eacc_nf_{aid}"):
+            st.session_state.pop("dlg_account_edit_id", None)
+            _request_clear_fm_accounts_grid()
+            st.rerun()
+        return
+
+    if "bank_catalog" not in st.session_state:
+        sync_bank_catalog_to_session()
+
+    atype = str(acc.get("account_type") or "").strip()
+    cur_bank = (acc.get("bank_code") or "").strip() or None
+
+    with st.form(f"dlg_edit_account_form_{aid}"):
+        right = _form_field_row(t("dlg_acc_name_edit"))
+        with right:
+            name_v = st.text_input(
+                "dlg_eacc_nm",
+                value=str(acc.get("name") or ""),
+                label_visibility="collapsed",
+                key=f"dlg_eacc_name_{aid}",
+            )
+        right = _form_field_row(t("dlg_owner"))
+        with right:
+            owner_v = st.text_input(
+                "dlg_eacc_ow",
+                value=str(acc.get("owner_name") or ""),
+                label_visibility="collapsed",
+                key=f"dlg_eacc_owner_{aid}",
+            )
+        right = _form_field_row(t("dlg_currency"))
+        with right:
+            cur_v = st.text_input(
+                "dlg_eacc_cur",
+                value=str(acc.get("currency") or "CNY"),
+                label_visibility="collapsed",
+                key=f"dlg_eacc_currency_{aid}",
+            )
+        right = _form_field_row(t("dlg_acc_active"))
+        with right:
+            active_v = st.checkbox(
+                "dlg_eacc_act",
+                value=bool(acc.get("is_active", True)),
+                label_visibility="collapsed",
+                key=f"dlg_eacc_active_{aid}",
+            )
+
+        bank_sel: str | None = None
+        if atype == "bank":
+            catalog = [
+                b
+                for b in (st.session_state.get("bank_catalog") or [])
+                if isinstance(b, dict) and (b.get("name") or "").strip()
+            ]
+            right = _form_field_row(t("dlg_bank_name"))
+            with right:
+                if catalog:
+                    codes = [str(b["code"]) for b in catalog]
+                    try:
+                        def_idx = codes.index(cur_bank) if cur_bank in codes else 0
+                    except ValueError:
+                        def_idx = 0
+                    bi = st.selectbox(
+                        "dlg_eacc_bank",
+                        options=list(range(len(catalog))),
+                        index=def_idx,
+                        format_func=lambda i: str(catalog[int(i)]["name"]),
+                        label_visibility="collapsed",
+                        key=f"dlg_eacc_bank_{aid}",
+                    )
+                    bank_sel = str(catalog[int(bi)]["code"])
+                else:
+                    st.caption(t("dlg_catalog_empty"))
+                    bank_sel = cur_bank
+
+        submit = st.form_submit_button(t("dlg_save"))
+
+    if submit:
+        payload: dict[str, object] = {
+            "name": name_v.strip(),
+            "owner_name": owner_v.strip() or None,
+            "currency": (cur_v or "CNY").strip().upper(),
+            "is_active": bool(active_v),
+        }
+        if atype == "bank":
+            payload["bank_code"] = bank_sel
+        ok, result = api_call("PATCH", f"/accounts/{aid}", payload=payload)
+        st.success(str(result)) if ok else st.error(result)
+        if ok:
+            st.session_state.pop("dlg_account_edit_id", None)
+            _request_clear_fm_accounts_grid()
+            st.rerun()
+
+
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_new_asset)
 def _dialog_new_asset() -> None:
     st.subheader(t("dlg_new_asset"))
     if st.button(t("dlg_close"), key="dlg_ast_close"):
         st.session_state.pop("dlg_asset_open", None)
         st.rerun()
 
+    # 查询结果必须在实例化带 key 的输入框之前写入对应 session_state（见 Streamlit 限制）。
+    _pending = st.session_state.pop("_dlg_ast_post_lookup", None)
+    if isinstance(_pending, dict):
+        if _pending.get("name"):
+            st.session_state["dlg_ast_name"] = str(_pending["name"])
+        if _pending.get("market"):
+            st.session_state["dlg_ast_market"] = str(_pending["market"])
+
     with st.form("dlg_create_asset_form"):
         right = _form_field_row(t("dlg_asset_type"))
         with right:
-            asset_type = st.selectbox(
+            st.selectbox(
                 "dlg_ast_at",
                 ["stock", "fund"],
                 label_visibility="collapsed",
@@ -1394,38 +1719,251 @@ def _dialog_new_asset() -> None:
             )
         right = _form_field_row(t("dlg_symbol"))
         with right:
-            symbol = st.text_input(
-                "dlg_ast_sym",
-                value="600519",
-                label_visibility="collapsed",
-                key="dlg_ast_symbol",
-            )
+            c_sym, c_qry = st.columns([4, 1], gap="small", vertical_alignment="center")
+            with c_sym:
+                st.text_input(
+                    "dlg_ast_sym",
+                    label_visibility="collapsed",
+                    key="dlg_ast_symbol",
+                    max_chars=16,
+                )
+            with c_qry:
+                query_submit = st.form_submit_button(t("dlg_ast_query"), use_container_width=True)
         right = _form_field_row(t("dlg_name"))
         with right:
-            name = st.text_input(
+            st.text_input(
                 "dlg_ast_nm",
-                value="贵州茅台",
                 label_visibility="collapsed",
                 key="dlg_ast_name",
             )
         right = _form_field_row(t("dlg_market"))
         with right:
-            market = st.text_input(
+            st.text_input(
                 "dlg_ast_mkt",
-                value="CN",
                 label_visibility="collapsed",
                 key="dlg_ast_market",
             )
-        submit = st.form_submit_button(t("dlg_save"))
-    if submit:
+        save_submit = st.form_submit_button(t("dlg_save"))
+
+    if query_submit:
+        asset_type_q = str(st.session_state.get("dlg_ast_type") or "stock")
+        sym_raw = st.session_state.get("dlg_ast_symbol", "")
+        sym_digits = "".join(c for c in str(sym_raw) if c.isdigit())
+        if len(sym_digits) != 6:
+            st.warning(t("err_ast_code_six"))
+        else:
+            with st.spinner(t("dlg_ast_query_running")):
+                name_g, mkt_g, errk = lookup_cn_security(asset_type_q, sym_digits)
+            if errk == LOOKUP_BAD_INPUT:
+                st.warning(t("err_ast_code_six"))
+            elif errk == LOOKUP_NOT_FOUND:
+                st.error(t("err_ast_lookup_not_found"))
+            elif errk == LOOKUP_NETWORK:
+                st.error(t("err_ast_lookup_network"))
+            elif name_g:
+                pl: dict[str, str] = {"name": name_g}
+                if mkt_g:
+                    pl["market"] = mkt_g
+                st.session_state["_dlg_ast_post_lookup"] = pl
+                st.rerun()
+            else:
+                st.error(t("err_ast_lookup_not_found"))
+
+    if save_submit:
+        asset_type = str(st.session_state.get("dlg_ast_type") or "stock")
+        symbol = str(st.session_state.get("dlg_ast_symbol") or "").strip()
+        name = str(st.session_state.get("dlg_ast_name") or "").strip()
+        market = str(st.session_state.get("dlg_ast_market") or "").strip()
+        if not symbol or not symbol.isdigit():
+            st.error(t("err_ast_symbol_digits"))
+            return
         ok, result = api_call(
             "POST",
             "/assets",
-            payload={"asset_type": asset_type, "symbol": symbol, "name": name, "market": market},
+            payload={
+                "asset_type": asset_type,
+                "symbol": symbol,
+                "name": name,
+                "market": market or None,
+            },
         )
         st.success(str(result)) if ok else st.error(result)
         if ok:
             st.session_state.pop("dlg_asset_open", None)
+            st.session_state.pop("_dlg_ast_post_lookup", None)
+            for _k in ("dlg_ast_symbol", "dlg_ast_name", "dlg_ast_market"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_asset_pick)
+def _dialog_asset_pick_actions() -> None:
+    """列表行选后：修改 / 删除。"""
+    raw_id = st.session_state.get("dlg_asset_pick_id")
+    if raw_id is None:
+        return
+    aid = int(raw_id)
+
+    st.subheader(t("dlg_row_actions_title"))
+    if st.button(t("dlg_close"), key=f"dlg_ast_pick_close_{aid}"):
+        st.session_state.pop("dlg_asset_pick_id", None)
+        _request_clear_fm_assets_grid()
+        st.rerun()
+
+    items = fetch_assets()
+    ast = next((a for a in items if int(a["id"]) == aid), None)
+    if ast is None:
+        st.error(t("err_asset_not_found"))
+        if st.button(t("dlg_close"), key=f"dlg_ast_pick_nf_{aid}"):
+            st.session_state.pop("dlg_asset_pick_id", None)
+            _request_clear_fm_assets_grid()
+            st.rerun()
+        return
+
+    st.markdown(html.escape(_fmt_asset_brief(ast)))
+    c0, c1 = st.columns(2)
+    with c0:
+        if st.button(t("btn_edit_asset"), key=f"dlg_ast_pick_edit_{aid}", use_container_width=True):
+            st.session_state.pop("dlg_asset_pick_id", None)
+            st.session_state["dlg_asset_edit_id"] = aid
+            _request_clear_fm_assets_grid()
+            st.rerun()
+    with c1:
+        if st.button(t("btn_delete_asset"), key=f"dlg_ast_pick_del_{aid}", use_container_width=True):
+            st.session_state.pop("dlg_asset_pick_id", None)
+            st.session_state["dlg_asset_delete_id"] = aid
+            _request_clear_fm_assets_grid()
+            st.rerun()
+
+
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_edit_asset)
+def _dialog_edit_asset() -> None:
+    aid = st.session_state.get("dlg_asset_edit_id")
+    if aid is None:
+        return
+    aid = int(aid)
+
+    if st.button(t("dlg_close"), key=f"dlg_east_close_{aid}"):
+        st.session_state.pop("dlg_asset_edit_id", None)
+        _request_clear_fm_assets_grid()
+        st.rerun()
+
+    items = fetch_assets()
+    ast = next((a for a in items if int(a["id"]) == aid), None)
+    if ast is None:
+        st.error(t("err_asset_not_found"))
+        if st.button(t("dlg_close"), key=f"dlg_east_nf_close_{aid}"):
+            st.session_state.pop("dlg_asset_edit_id", None)
+            _request_clear_fm_assets_grid()
+            st.rerun()
+        return
+
+    if ast.get("has_open_position"):
+        st.warning(t("cap_ast_has_position"))
+        if st.button(t("dlg_close"), key=f"dlg_east_blk_close_{aid}"):
+            st.session_state.pop("dlg_asset_edit_id", None)
+            _request_clear_fm_assets_grid()
+            st.rerun()
+        return
+
+    st.subheader(t("dlg_edit_asset"))
+    cur_at = str(ast.get("asset_type") or "stock")
+    if cur_at not in ("stock", "fund"):
+        cur_at = "stock"
+    cur_sym = str(ast.get("symbol") or "")
+    cur_nm = str(ast.get("name") or "")
+    cur_mkt = str(ast.get("market") or "")
+
+    with st.form(f"dlg_edit_asset_form_{aid}"):
+        right = _form_field_row(t("dlg_asset_type"))
+        with right:
+            at_i = ["stock", "fund"].index(cur_at) if cur_at in ("stock", "fund") else 0
+            asset_type = st.selectbox(
+                "dlg_east_at",
+                ["stock", "fund"],
+                index=at_i,
+                label_visibility="collapsed",
+                key=f"dlg_east_type_{aid}",
+            )
+        right = _form_field_row(t("dlg_symbol"))
+        with right:
+            symbol = st.text_input(
+                "dlg_east_sym",
+                value=cur_sym,
+                label_visibility="collapsed",
+                key=f"dlg_east_symbol_{aid}",
+            )
+        right = _form_field_row(t("dlg_name"))
+        with right:
+            name = st.text_input(
+                "dlg_east_nm",
+                value=cur_nm,
+                label_visibility="collapsed",
+                key=f"dlg_east_name_{aid}",
+            )
+        right = _form_field_row(t("dlg_market"))
+        with right:
+            market = st.text_input(
+                "dlg_east_mkt",
+                value=cur_mkt,
+                label_visibility="collapsed",
+                key=f"dlg_east_market_{aid}",
+            )
+        submit = st.form_submit_button(t("dlg_save"))
+
+    if submit:
+        ok, result = api_call(
+            "PATCH",
+            f"/assets/{aid}",
+            payload={
+                "asset_type": asset_type,
+                "symbol": symbol.strip(),
+                "name": name.strip(),
+                "market": market.strip() or None,
+            },
+        )
+        st.success(str(result)) if ok else st.error(result)
+        if ok:
+            st.session_state.pop("dlg_asset_edit_id", None)
+            _request_clear_fm_assets_grid()
+            st.rerun()
+
+
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_delete_asset)
+def _dialog_delete_asset() -> None:
+    aid = st.session_state.get("dlg_asset_delete_id")
+    if aid is None:
+        return
+    aid = int(aid)
+
+    if st.button(t("dlg_close"), key=f"dlg_dast_close_{aid}"):
+        st.session_state.pop("dlg_asset_delete_id", None)
+        _request_clear_fm_assets_grid()
+        st.rerun()
+
+    items = fetch_assets()
+    ast = next((a for a in items if int(a["id"]) == aid), None)
+    if ast is None:
+        st.error(t("err_asset_not_found"))
+        return
+
+    st.subheader(t("dlg_delete_asset"))
+    st.markdown(html.escape(_fmt_asset_brief(ast)))
+
+    if ast.get("has_open_position"):
+        st.warning(t("cap_ast_has_position"))
+        return
+
+    confirm = st.checkbox(t("dlg_delete_asset_confirm"), key=f"dlg_dast_confirm_{aid}")
+    if st.button(t("dlg_delete_asset_submit"), key=f"dlg_dast_go_{aid}", disabled=not confirm):
+        ok, result = api_call("DELETE", f"/assets/{aid}")
+        if ok:
+            st.success(t("msg_delete_ok"))
+        else:
+            st.error(_friendly_delete_error(result, kind="asset"))
+        if ok:
+            st.session_state.pop("dlg_asset_delete_id", None)
+            _request_clear_fm_assets_grid()
             st.rerun()
 
 
@@ -1442,7 +1980,7 @@ def _tx_shows_fee_field(tx_type: str) -> bool:
     return tx_type in ("buy", "sell", "expense")
 
 
-@st.dialog(" ", width="large")
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_new_transaction)
 def _dialog_new_transaction() -> None:
     st.subheader(t("dlg_new_tx"))
     accounts = fetch_accounts()
@@ -1695,7 +2233,7 @@ def _tx_detail_notional_label(qty: object, price: object) -> str:
         return "—"
 
 
-@st.dialog(" ", width="large")
+@st.dialog(" ", width="large", on_dismiss=_dismiss_dialog_transaction_detail)
 def _dialog_transaction_detail() -> None:
     tid = st.session_state.get("dlg_tx_detail_id")
     if not tid:
@@ -1843,6 +2381,8 @@ def render_pnl_overview_panel() -> None:
 
 
 def render_accounts_panel() -> None:
+    if st.session_state.pop(_PENDING_CLEAR_FM_ACCOUNTS_GRID, False):
+        _clear_fm_grid_selection(_FM_ACCOUNTS_GRID_KEY)
     if "bank_catalog" not in st.session_state:
         sync_bank_catalog_to_session()
     elif not st.session_state.get("bank_catalog") and not st.session_state.get(
@@ -1859,7 +2399,10 @@ def render_accounts_panel() -> None:
         )
     with _bcol:
         if st.button(t("btn_new_account"), key="fm_btn_open_account"):
+            for _k in ("dlg_account_pick_id", "dlg_account_edit_id", "dlg_account_delete_id"):
+                st.session_state.pop(_k, None)
             st.session_state["dlg_account_open"] = True
+            _request_clear_fm_accounts_grid()
     with _pcol:
         if hasattr(st, "popover"):
             with st.popover(t("popover_book_help")):
@@ -1868,7 +2411,13 @@ def render_accounts_panel() -> None:
             with st.expander(t("expander_book_help"), expanded=False):
                 st.markdown(t("help_markdown"))
 
-    if st.session_state.get("dlg_account_open"):
+    if st.session_state.get("dlg_account_delete_id") is not None:
+        _dialog_delete_account()
+    elif st.session_state.get("dlg_account_edit_id") is not None:
+        _dialog_edit_account()
+    elif st.session_state.get("dlg_account_pick_id") is not None:
+        _dialog_account_pick_actions()
+    elif st.session_state.get("dlg_account_open"):
         _dialog_new_account()
 
     ok, result = api_call("GET", "/accounts")
@@ -1876,7 +2425,16 @@ def render_accounts_panel() -> None:
         items = result.get("data", {}).get("items", [])
         st.subheader(t("sub_account_list"))
         if items:
-            st.dataframe(prepare_grid_rows(items), use_container_width=True, hide_index=True)
+            _consume_accounts_grid_row_pick(items)
+            acc_df = pd.DataFrame(prepare_grid_rows(items))
+            st.dataframe(
+                acc_df,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key=_FM_ACCOUNTS_GRID_KEY,
+            )
         else:
             st.info(t("info_no_accounts_list"))
     else:
@@ -1884,6 +2442,8 @@ def render_accounts_panel() -> None:
 
 
 def render_assets_panel() -> None:
+    if st.session_state.pop(_PENDING_CLEAR_FM_ASSETS_GRID, False):
+        _clear_fm_grid_selection(_FM_ASSETS_GRID_KEY)
     _title_col, _btn_col = st.columns([0.68, 0.32], gap="small", vertical_alignment="center")
     with _title_col:
         st.markdown(
@@ -1892,9 +2452,21 @@ def render_assets_panel() -> None:
         )
     with _btn_col:
         if st.button(t("btn_new_asset"), key="fm_btn_open_asset"):
+            for _k in ("dlg_asset_pick_id", "dlg_asset_edit_id", "dlg_asset_delete_id"):
+                st.session_state.pop(_k, None)
+            st.session_state.pop("_dlg_ast_post_lookup", None)
+            for _k in ("dlg_ast_symbol", "dlg_ast_name", "dlg_ast_market"):
+                st.session_state.pop(_k, None)
             st.session_state["dlg_asset_open"] = True
+            _request_clear_fm_assets_grid()
 
-    if st.session_state.get("dlg_asset_open"):
+    if st.session_state.get("dlg_asset_delete_id") is not None:
+        _dialog_delete_asset()
+    elif st.session_state.get("dlg_asset_edit_id") is not None:
+        _dialog_edit_asset()
+    elif st.session_state.get("dlg_asset_pick_id") is not None:
+        _dialog_asset_pick_actions()
+    elif st.session_state.get("dlg_asset_open"):
         _dialog_new_asset()
 
     ok, result = api_call("GET", "/assets")
@@ -1902,7 +2474,18 @@ def render_assets_panel() -> None:
         items = result.get("data", {}).get("items", [])
         st.subheader(t("sub_asset_list"))
         if items:
-            st.dataframe(prepare_grid_rows(items), use_container_width=True, hide_index=True)
+            _consume_assets_grid_row_pick(items)
+            ast_df = pd.DataFrame(
+                prepare_grid_rows(items, drop_keys=frozenset({"has_open_position"})),
+            )
+            st.dataframe(
+                ast_df,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key=_FM_ASSETS_GRID_KEY,
+            )
         else:
             st.info(t("info_no_assets"))
     else:
@@ -1968,6 +2551,58 @@ def _clear_fm_tx_list_df_selection() -> None:
     st.session_state[_fm_tx_list_df_state_key()] = {
         "selection": {"rows": [], "columns": [], "cells": []},
     }
+
+
+def _consume_accounts_grid_row_pick(items: list[dict]) -> None:
+    """在 ``st.dataframe`` 之前消费行选：打开操作弹窗并清空表格 widget 状态（创建 widget 后不能再写同一 key）。"""
+    if (
+        st.session_state.get("dlg_account_pick_id") is not None
+        or st.session_state.get("dlg_account_edit_id") is not None
+        or st.session_state.get("dlg_account_delete_id") is not None
+    ):
+        return
+    raw = st.session_state.get(_FM_ACCOUNTS_GRID_KEY)
+    if not raw:
+        return
+    try:
+        rows = raw["selection"]["rows"]
+    except (KeyError, TypeError, AttributeError):
+        return
+    if not rows:
+        return
+    ri = int(rows[0])
+    if ri < 0 or ri >= len(items):
+        return
+    st.session_state.pop("dlg_account_open", None)
+    st.session_state["dlg_account_pick_id"] = int(items[ri]["id"])
+    _clear_fm_grid_selection(_FM_ACCOUNTS_GRID_KEY)
+    st.rerun()
+
+
+def _consume_assets_grid_row_pick(items: list[dict]) -> None:
+    """在 ``st.dataframe`` 之前消费行选：打开操作弹窗并清空表格 widget 状态。"""
+    if (
+        st.session_state.get("dlg_asset_pick_id") is not None
+        or st.session_state.get("dlg_asset_edit_id") is not None
+        or st.session_state.get("dlg_asset_delete_id") is not None
+    ):
+        return
+    raw = st.session_state.get(_FM_ASSETS_GRID_KEY)
+    if not raw:
+        return
+    try:
+        rows = raw["selection"]["rows"]
+    except (KeyError, TypeError, AttributeError):
+        return
+    if not rows:
+        return
+    ri = int(rows[0])
+    if ri < 0 or ri >= len(items):
+        return
+    st.session_state.pop("dlg_asset_open", None)
+    st.session_state["dlg_asset_pick_id"] = int(items[ri]["id"])
+    _clear_fm_grid_selection(_FM_ASSETS_GRID_KEY)
+    st.rerun()
 
 
 def _apply_tx_list_row_selection_to_detail(items: list[dict], *, skip_if_query_opened: bool) -> None:

@@ -57,6 +57,21 @@ def run_smoke(base: str, user_prefix: str, password: str) -> dict[str, dict]:
     alipay_account_id = response.json()["data"]["id"]
 
     response = requests.post(
+        f"{base}/accounts",
+        headers=headers,
+        json={"name": "disposable", "account_type": "cash", "currency": "CNY", "initial_balance": "0.00"},
+        timeout=10,
+    )
+    results["create_account_disposable"] = pack_response(response)
+    disposable_account_id = response.json()["data"]["id"]
+
+    response = requests.delete(f"{base}/accounts/{disposable_account_id}", headers=headers, timeout=10)
+    results["delete_account_empty"] = pack_response(response)
+
+    response = requests.delete(f"{base}/accounts/{bank_account_id}", headers=headers, timeout=10)
+    results["delete_account_with_activity"] = pack_response(response)
+
+    response = requests.post(
         f"{base}/assets",
         headers=headers,
         json={"asset_type": "stock", "symbol": "600519", "name": "moutai", "market": "CN"},
@@ -118,6 +133,34 @@ def run_smoke(base: str, user_prefix: str, password: str) -> dict[str, dict]:
     results["sell"] = pack_response(response)
 
     response = requests.post(
+        f"{base}/assets",
+        headers=headers,
+        json={"asset_type": "fund", "symbol": "ZZPATCH", "name": "patch del", "market": "CN"},
+        timeout=10,
+    )
+    results["create_asset_patch_delete"] = pack_response(response)
+    flat_asset_id = response.json()["data"]["id"]
+
+    response = requests.patch(
+        f"{base}/assets/{flat_asset_id}",
+        headers=headers,
+        json={"name": "patched name"},
+        timeout=10,
+    )
+    results["patch_asset_no_position"] = pack_response(response)
+
+    response = requests.delete(f"{base}/assets/{flat_asset_id}", headers=headers, timeout=10)
+    results["delete_asset_no_tx"] = pack_response(response)
+
+    response = requests.patch(
+        f"{base}/assets/{asset_id}",
+        headers=headers,
+        json={"name": "nope"},
+        timeout=10,
+    )
+    results["patch_asset_blocked_position"] = pack_response(response)
+
+    response = requests.post(
         f"{base}/transfers",
         headers=headers,
         json={
@@ -145,9 +188,15 @@ def run_smoke(base: str, user_prefix: str, password: str) -> dict[str, dict]:
     response = requests.get(f"{base}/accounts", headers=headers, timeout=10)
     results["accounts"] = pack_response(response)
 
+    status_expect = {
+        "patch_asset_blocked_position": 409,
+        "delete_account_with_activity": 409,
+    }
     checkpoints = {
         "all_steps_ok": all(
-            step["status"] == 200 for key, step in results.items() if key not in {"meta"}
+            step["status"] == status_expect.get(key, 200)
+            for key, step in results.items()
+            if key not in {"meta", "checkpoints"}
         ),
         "expected_position_qty": None,
         "expected_realized_pnl": None,
