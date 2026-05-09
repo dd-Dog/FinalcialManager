@@ -1,10 +1,12 @@
 pandas
+requests>=2.28.0
 akshare
 matplotlib
 streamlit>=1.40.1
 python-dotenv
 fastapi
 uvicorn
+APScheduler>=3.10.0
 sqlalchemy
 alembic
 psycopg[binary]

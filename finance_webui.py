@@ -21,8 +21,22 @@ from finance_i18n import account_type_label, asset_type_label, t, tx_type_label
 
 DEFAULT_API_BASE = "http://127.0.0.1:8000/api/v1"
 
+
+def _api_request_timeout_seconds() -> float:
+    """``requests`` 读超时；须略大于后端慢接口（如 ``/positions`` 并行拉行情的上限）。"""
+    raw = (os.getenv("FM_API_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            return max(5.0, min(float(raw), 300.0))
+        except ValueError:
+            pass
+    return 45.0
+
+
 # 表格/API 中可能为 ISO 的时间字段，展示为 YYYY/MM/DD HH:MM
-TIME_COLUMN_KEYS = frozenset({"occurred_at", "start_date", "end_date", "created_at", "updated_at"})
+TIME_COLUMN_KEYS = frozenset(
+    {"occurred_at", "start_date", "end_date", "created_at", "updated_at", "ref_price_updated_at"}
+)
 
 
 def _user_tzinfo():
@@ -412,7 +426,50 @@ def _fm_auth_cookie_raw(cookies_obj: object) -> str | None:
     return None
 
 
+_FM_AUTH_REJECTED_KEY = "_fm_api_auth_rejected"
+
+
+def _pop_auth_rejected_flag() -> None:
+    st.session_state.pop(_FM_AUTH_REJECTED_KEY, None)
+
+
+def _reject_auth_cookie_restore() -> None:
+    """标记：勿从 Cookie 回填 token（例如已 401 或 Cookie 内为过期 token）。"""
+    st.session_state[_FM_AUTH_REJECTED_KEY] = True
+
+
+def _pop_authenticated_session_keys() -> None:
+    """与退出登录一致：清 token、导航、弹窗与列表分页等（不发送 Cookie JS）。"""
+    for k in (
+        "token",
+        "username",
+        "nav_page",
+        "bank_catalog",
+        "bank_catalog_is_builtin",
+        "_bank_catalog_load_attempted",
+        "pos_holdings_page",
+        "assets_list_page",
+        "_fm_assets_list_page",
+        "tx_list_page",
+        *SESSION_DLG_KEYS,
+        *SESSION_TX_DETAIL_KEYS,
+        *SESSION_GRID_KEYS,
+        *SESSION_PENDING_GRID_CLEAR_KEYS,
+    ):
+        st.session_state.pop(k, None)
+
+
+def _handle_api_unauthorized() -> None:
+    """401：清会话、清 fm_auth、禁止 Cookie 回填，并立刻重跑以进入登录页。"""
+    _reject_auth_cookie_restore()
+    _pop_authenticated_session_keys()
+    _clear_auth_cookie()
+    st.rerun()
+
+
 def _restore_auth_cookie_if_needed() -> None:
+    if st.session_state.get(_FM_AUTH_REJECTED_KEY):
+        return
     if st.session_state.get("token"):
         return
     raw: str | None = None
@@ -537,7 +594,14 @@ def api_call(
         headers.update(auth_headers)
 
     try:
-        response = requests.request(method, url, json=payload, params=params, headers=headers, timeout=15)
+        response = requests.request(
+            method,
+            url,
+            json=payload,
+            params=params,
+            headers=headers,
+            timeout=_api_request_timeout_seconds(),
+        )
     except requests.RequestException as exc:
         return False, t("err_request", exc=str(exc))
 
@@ -545,6 +609,9 @@ def api_call(
         body = response.json()
     except ValueError:
         body = response.text
+
+    if response.status_code == 401 and require_auth:
+        _handle_api_unauthorized()
 
     if response.status_code >= 400:
         if isinstance(body, dict):
@@ -1439,6 +1506,7 @@ def render_login_screen() -> None:
                         ):
                             st.session_state.pop(_dk, None)
                         st.session_state.pop("pos_holdings_page", None)
+                        _pop_auth_rejected_flag()
                         _persist_auth_cookie(str(token), str(username))
                         st.rerun()
                     else:
@@ -1480,21 +1548,9 @@ def render_sidebar_nav() -> str:
     st.sidebar.divider()
     st.sidebar.caption(t("user_label", name=st.session_state.get("username", "") or "—"))
     if st.sidebar.button(t("logout"), key="fm_logout", use_container_width=True, type="primary"):
+        _pop_auth_rejected_flag()
+        _pop_authenticated_session_keys()
         _clear_auth_cookie()
-        for k in (
-            "token",
-            "username",
-            "nav_page",
-            "bank_catalog",
-            "bank_catalog_is_builtin",
-            "_bank_catalog_load_attempted",
-            *SESSION_DLG_KEYS,
-            *SESSION_TX_DETAIL_KEYS,
-            *SESSION_GRID_KEYS,
-            *SESSION_PENDING_GRID_CLEAR_KEYS,
-            "pos_holdings_page",
-        ):
-            st.session_state.pop(k, None)
         st.rerun()
 
     return st.session_state.get("nav_page", "overview")
@@ -1844,6 +1900,8 @@ def _dialog_new_asset() -> None:
             st.session_state["dlg_ast_name"] = str(_pending["name"])
         if _pending.get("market"):
             st.session_state["dlg_ast_market"] = str(_pending["market"])
+    if "dlg_ast_market" not in st.session_state:
+        st.session_state["dlg_ast_market"] = "CN"
 
     with st.form("dlg_create_asset_form"):
         right = _form_field_row(t("dlg_asset_type"))

@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.auth.deps import get_current_user
-from backend.core.formatting import dec2
+from backend.core.formatting import dec2, dec2_opt
 from backend.db.session import get_db
 from backend.models.entities import Asset, Position, Transaction, User
 from backend.schemas.assets import CreateAssetRequest, UpdateAssetRequest
@@ -71,6 +71,10 @@ def list_assets(
                 "symbol": asset.symbol,
                 "name": asset.name,
                 "market": asset.market,
+                "last_price": dec2_opt(asset.ref_last_price),
+                "ref_price_updated_at": asset.ref_price_updated_at.isoformat()
+                if asset.ref_price_updated_at is not None
+                else None,
                 "position_quantity": dec2(pq),
                 "has_open_position": abs(pq) > _QTY_EPS,
             }
@@ -105,6 +109,10 @@ def create_asset(
             "symbol": asset.symbol,
             "name": asset.name,
             "market": asset.market,
+            "last_price": dec2_opt(asset.ref_last_price),
+            "ref_price_updated_at": asset.ref_price_updated_at.isoformat()
+            if asset.ref_price_updated_at is not None
+            else None,
         }
     )
 
@@ -159,6 +167,10 @@ def update_asset(
             "symbol": asset.symbol,
             "name": asset.name,
             "market": asset.market,
+            "last_price": dec2_opt(asset.ref_last_price),
+            "ref_price_updated_at": asset.ref_price_updated_at.isoformat()
+            if asset.ref_price_updated_at is not None
+            else None,
         }
     )
 

@@ -25,6 +25,7 @@ _COLUMN_I18N_KEYS: frozenset[str] = frozenset(
         "cost_amount",
         "floating_pnl",
         "last_price",
+        "ref_price_updated_at",
         "realized_pnl",
         "book_value",
         "seq",

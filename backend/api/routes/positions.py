@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 
 from backend.auth.deps import get_current_user
 from backend.core.formatting import dec2, dec2_opt
-from backend.core.last_price_cn import fetch_last_price_cn
 from backend.db.session import get_db
 from backend.models.entities import Account, Asset, Position, Transaction, User
 from backend.schemas.common import APIResponse
@@ -80,10 +79,9 @@ def list_positions(
         ac_d = Decimal(str(position.avg_cost or 0))
         lp_dec: Decimal | None = None
         fp_dec: Decimal | None = None
-        if abs(qty_d) > _QTY_EPS:
-            lp_dec = fetch_last_price_cn(asset.asset_type, asset.symbol)
-            if lp_dec is not None:
-                fp_dec = qty_d * (lp_dec - ac_d)
+        if abs(qty_d) > _QTY_EPS and asset.ref_last_price is not None:
+            lp_dec = Decimal(str(asset.ref_last_price))
+            fp_dec = qty_d * (lp_dec - ac_d)
 
         ca_lbl = _cash_account_label(account)
         item_row = {

@@ -43,6 +43,9 @@ class Asset(Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     market: Mapped[str | None] = mapped_column(String(32))
+    # 由定时任务写入的参考单价（元/份），非实时行情；见 scripts/sync_asset_ref_prices.py
+    ref_last_price: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    ref_price_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

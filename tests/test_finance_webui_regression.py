@@ -91,6 +91,8 @@ def test_column_label_single_language() -> None:
     st.session_state["ui_lang"] = "zh"
     assert cl.column_label("floating_pnl") == "浮动盈亏"
     assert cl.column_label("last_price") == "参考市价"
+    assert cl.column_label("ref_price_updated_at") == "参考价更新于"
     st.session_state["ui_lang"] = "en"
     assert cl.column_label("floating_pnl") == "Floating P&L"
     assert cl.column_label("last_price") == "Last price (ref.)"
+    assert cl.column_label("ref_price_updated_at") == "Ref. price updated at"
