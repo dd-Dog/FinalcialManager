@@ -329,13 +329,56 @@ TX_LIST_PAGE_SIZE = 10
 ASSETS_LIST_PAGE_SIZE = 20
 POSITIONS_HOLDINGS_PAGE_SIZE = 10
 
-# 登录态 Cookie：整页刷新会新建 Streamlit 会话，用主页面 Cookie + ``st.context.cookies`` 恢复 token。
-# （extra_streamlit_components 写在 iframe 里的 cookie 往往不会出现在主文档请求里，故不用。）
+# 登录态 Cookie：整页刷新会新建 Streamlit 会话；优先 ``extra_streamlit_components.CookieManager`` 写主文档 Cookie，
+# 辅以 ``components.html`` 与 ``st.context.cookies`` / ``Cookie`` 请求头兜底。
 #
 # 生产环境若刷新仍回登录，常见原因：① 反代未把浏览器 Cookie 传到 Streamlit（须转发 Cookie 头）；
 # ② 应用挂在子路径下须设置 ``FM_AUTH_COOKIE_PATH`` 与浏览器访问路径前缀一致；③ 跨站嵌入需
-# ``FM_AUTH_COOKIE_SAMESITE=none``（仅 HTTPS，且自动带 Secure）。
+# ``FM_AUTH_COOKIE_SAMESITE=none``（仅 HTTPS，且自动带 Secure）；④ 多子域共享登录态时配置
+# ``FM_AUTH_COOKIE_DOMAIN``（如 ``.example.com``）；⑤ ``FM_API_BASE`` 指向错误后端导致首屏 401 会清 Cookie。
 _AUTH_COOKIE = "fm_auth"
+_FM_AUTH_COOKIE_MGR_KEY = "fm_auth_cookie_mgr_esc"
+
+
+def _fm_auth_debug_enabled() -> bool:
+    return os.getenv("FM_AUTH_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fm_auth_log(msg: str) -> None:
+    """诊断日志（不写 token 全文）；在 Streamlit 进程终端可见。开启：``FM_AUTH_DEBUG=1``。"""
+    if not _fm_auth_debug_enabled():
+        return
+    print(f"[fm_auth_debug] {msg}", flush=True)
+
+
+def _fm_auth_cookie_header_probe() -> str:
+    """供调试：描述 ``Cookie`` 请求头是否可能含 ``fm_auth``（不打印敏感内容）。"""
+    try:
+        h = getattr(st.context, "headers", None)
+        if h is None:
+            return "headers=None"
+        if len(h) == 0:
+            return "headers_len=0"
+        get = getattr(h, "get", None)
+        raw = get("Cookie") if callable(get) else None
+        if not raw:
+            try:
+                raw = h["Cookie"]
+            except Exception:
+                return "no_cookie_header"
+        s = str(raw)
+        needle = _AUTH_COOKIE.lower()
+        return f"cookie_header_len={len(s)} contains_{_AUTH_COOKIE}={'yes' if needle in s.lower() else 'no'}"
+    except Exception as e:
+        return f"cookie_header_probe_err={type(e).__name__}"
+
+
+def _auth_cookie_domain_js_literal() -> str:
+    """供 JS 拼接的 ``Domain`` 片段：空串或 ``; Domain=host``（须与写入、清除时一致）。"""
+    d = (os.getenv("FM_AUTH_COOKIE_DOMAIN") or "").strip()
+    if not d:
+        return '""'
+    return json.dumps(f"; Domain={d}")
 
 
 def _auth_cookie_path() -> str:
@@ -358,6 +401,95 @@ def _auth_cookie_samesite_attr() -> str:
     return "Lax"
 
 
+def _auth_cookie_secure_for_cm() -> bool | None:
+    """``CookieManager`` 的 ``secure``：未设置则由库处理；显式 0 表示本地 HTTP。"""
+    v = (os.getenv("FM_AUTH_COOKIE_SECURE") or "").strip().lower()
+    if v in ("0", "false", "no"):
+        return False
+    if v in ("1", "true", "yes"):
+        return True
+    return None
+
+
+def _cm_same_site_kw() -> str:
+    """``CookieManager`` 仅支持 ``lax`` / ``strict``（与 ``FM_AUTH_COOKIE_SAMESITE`` 大致对齐）。"""
+    v = _auth_cookie_samesite_attr().strip().lower()
+    if v == "strict":
+        return "strict"
+    return "lax"
+
+
+def _fm_auth_cookie_manager():
+    """``CookieManager``：在主文档上读写 Cookie，反代 + 全页刷新时往往比 iframe 内 ``document.cookie`` 可靠。"""
+    try:
+        from extra_streamlit_components import CookieManager
+
+        return CookieManager(key=_FM_AUTH_COOKIE_MGR_KEY)
+    except Exception:
+        return None
+
+
+def _persist_auth_cookie_manager(token: str, username: str) -> None:
+    cm = _fm_auth_cookie_manager()
+    if cm is None:
+        _fm_auth_log("CookieManager 不可用（未安装 extra-streamlit-components 或导入失败）")
+        return
+    try:
+        payload = json.dumps({"token": token, "username": username}, separators=(",", ":"))
+        dom = (os.getenv("FM_AUTH_COOKIE_DOMAIN") or "").strip() or None
+        n = int(st.session_state.get("_fm_cm_set_seq", 0)) + 1
+        st.session_state["_fm_cm_set_seq"] = n
+        cm.set(
+            _AUTH_COOKIE,
+            payload,
+            key=f"fm_esc_set_{n}",
+            path=_auth_cookie_path(),
+            max_age=1209600.0,
+            domain=dom,
+            secure=_auth_cookie_secure_for_cm(),
+            same_site=_cm_same_site_kw(),
+        )
+        _fm_auth_log(
+            f"CookieManager.set ok path={_auth_cookie_path()!r} domain={dom!r} "
+            f"payload_len={len(payload)} token_len={len(token)}"
+        )
+    except Exception as e:
+        _fm_auth_log(f"CookieManager.set failed: {type(e).__name__}: {str(e)[:180]}")
+
+
+def _delete_auth_cookie_manager() -> None:
+    cm = _fm_auth_cookie_manager()
+    if cm is None:
+        return
+    try:
+        n = int(st.session_state.get("_fm_cm_del_seq", 0)) + 1
+        st.session_state["_fm_cm_del_seq"] = n
+        cm.delete(_AUTH_COOKIE, key=f"fm_esc_del_{n}")
+    except Exception:
+        pass
+
+
+def _restore_raw_from_cookie_manager() -> str | None:
+    cm = _fm_auth_cookie_manager()
+    if cm is None:
+        _fm_auth_log("restore: CookieManager 不可用")
+        return None
+    try:
+        cm.get_all(key="fm_esc_cookie_sync")
+    except Exception as e:
+        _fm_auth_log(f"restore: CookieManager.get_all err {type(e).__name__}")
+    try:
+        v = cm.get(_AUTH_COOKIE)
+        if v:
+            s = str(v).strip()
+            _fm_auth_log(f"restore: CookieManager.get 命中 payload_len={len(s)}")
+            return s
+        _fm_auth_log("restore: CookieManager.get 无 fm_auth 键")
+    except Exception as e:
+        _fm_auth_log(f"restore: CookieManager.get err {type(e).__name__}: {str(e)[:120]}")
+    return None
+
+
 def _persist_auth_cookie(token: str, username: str) -> None:
     """写入浏览器 Cookie，刷新后由 ``st.context.cookies`` 恢复。
 
@@ -369,12 +501,14 @@ def _persist_auth_cookie(token: str, username: str) -> None:
     path_lit = json.dumps(_auth_cookie_path())
     same_site = _auth_cookie_samesite_attr()
     ss_lit = json.dumps(same_site)
+    domain_lit = _auth_cookie_domain_js_literal()
     html = f"""
 <div style="height:1px;width:1px;overflow:hidden"></div>
 <script>
 (function () {{
   const raw = {js_payload};
   const cookiePath = {path_lit};
+  const domainAttr = {domain_lit};
   const sameSite = {ss_lit};
   var secure = "";
   try {{
@@ -384,7 +518,7 @@ def _persist_auth_cookie(token: str, username: str) -> None:
       secure = "; Secure";
     }}
   }} catch (e0) {{}}
-  const part = "{_AUTH_COOKIE}=" + encodeURIComponent(raw) + "; Path=" + cookiePath + "; Max-Age=1209600; SameSite=" + sameSite + secure;
+  const part = "{_AUTH_COOKIE}=" + encodeURIComponent(raw) + "; Path=" + cookiePath + domainAttr + "; Max-Age=1209600; SameSite=" + sameSite + secure;
   const apply = function (doc) {{
     try {{ doc.cookie = part; return true; }} catch (e) {{ return false; }}
   }};
@@ -401,6 +535,7 @@ def _persist_auth_cookie(token: str, username: str) -> None:
 </script>
 """
     components.html(html, height=1, width=1)
+    _persist_auth_cookie_manager(token, username)
 
 
 def _fm_auth_cookie_raw(cookies_obj: object) -> str | None:
@@ -423,6 +558,46 @@ def _fm_auth_cookie_raw(cookies_obj: object) -> str | None:
                     return str(v).strip()
     except Exception:
         pass
+    return None
+
+
+def _fm_auth_raw_from_request_cookie_header() -> str | None:
+    """从 ``st.context.headers`` 的 ``Cookie`` 中解析 ``fm_auth`` 值（反代下 ``st.context.cookies`` 为空时兜底）。"""
+    if not hasattr(st, "context"):
+        return None
+    h = getattr(st.context, "headers", None)
+    if h is None:
+        return None
+    try:
+        if len(h) == 0:
+            return None
+    except Exception:
+        pass
+    header_val: str | None = None
+    try:
+        get = getattr(h, "get", None)
+        if callable(get):
+            header_val = get("Cookie") or get("cookie")
+    except Exception:
+        header_val = None
+    if not header_val:
+        try:
+            header_val = h["Cookie"]
+        except Exception:
+            try:
+                header_val = h["cookie"]
+            except Exception:
+                return None
+    if not header_val:
+        return None
+    for part in str(header_val).split(";"):
+        p = part.strip()
+        if not p or "=" not in p:
+            continue
+        name, val = p.split("=", 1)
+        if name.strip().lower() == _AUTH_COOKIE.lower():
+            v = val.strip()
+            return unquote(v) if v else None
     return None
 
 
@@ -461,6 +636,7 @@ def _pop_authenticated_session_keys() -> None:
 
 def _handle_api_unauthorized() -> None:
     """401：清会话、清 fm_auth、禁止 Cookie 回填，并立刻重跑以进入登录页。"""
+    _fm_auth_log("401: 将清除会话与 fm_auth（若误杀请查 FM_API_BASE / JWT 是否一致）")
     _reject_auth_cookie_restore()
     _pop_authenticated_session_keys()
     _clear_auth_cookie()
@@ -469,16 +645,44 @@ def _handle_api_unauthorized() -> None:
 
 def _restore_auth_cookie_if_needed() -> None:
     if st.session_state.get(_FM_AUTH_REJECTED_KEY):
+        _fm_auth_log("restore: 跳过（已标记 _fm_api_auth_rejected，例如刚 401）")
         return
     if st.session_state.get("token"):
+        _fm_auth_log("restore: 已有 session token，跳过 Cookie 恢复")
         return
     raw: str | None = None
+    src = ""
+    try:
+        raw = _restore_raw_from_cookie_manager()
+        if raw:
+            src = "cookie_manager"
+    except Exception as e:
+        _fm_auth_log(f"restore: CookieManager 异常 {type(e).__name__}")
+        raw = None
     if hasattr(st, "context"):
-        try:
-            raw = _fm_auth_cookie_raw(st.context.cookies)
-        except Exception:
-            raw = None
+        if not raw:
+            try:
+                raw = _fm_auth_cookie_raw(st.context.cookies)
+                if raw:
+                    src = "st.context.cookies"
+            except Exception:
+                raw = None
+        if not raw:
+            try:
+                raw = _fm_auth_raw_from_request_cookie_header()
+                if raw:
+                    src = "cookie_header"
+            except Exception:
+                raw = None
     if not raw:
+        probe = _fm_auth_cookie_header_probe() if hasattr(st, "context") else "no_st.context"
+        keys_fragment = ""
+        if hasattr(st, "context") and hasattr(st.context, "cookies"):
+            try:
+                keys_fragment = f" | context_cookie_keys={list(st.context.cookies.keys())}"
+            except Exception:
+                keys_fragment = " | context_cookie_keys=<err>"
+        _fm_auth_log("restore: 三路径均无 fm_auth | " + probe + keys_fragment)
         return
     try:
         data = json.loads(raw)
@@ -486,8 +690,10 @@ def _restore_auth_cookie_if_needed() -> None:
         try:
             data = json.loads(unquote(raw))
         except (json.JSONDecodeError, TypeError, ValueError):
+            _fm_auth_log(f"restore: JSON 解析失败 raw_len={len(raw)}")
             return
     except (TypeError, ValueError):
+        _fm_auth_log("restore: JSON 解析类型错误")
         return
     tok = data.get("token")
     if tok:
@@ -496,17 +702,23 @@ def _restore_auth_cookie_if_needed() -> None:
         if un:
             st.session_state["username"] = str(un)
         st.session_state.setdefault("nav_page", "overview")
+        _fm_auth_log(
+            f"restore: 成功 source={src} user={str(un)[:32]!r} token_len={len(str(tok))}"
+        )
 
 
 def _clear_auth_cookie() -> None:
+    _delete_auth_cookie_manager()
     path_lit = json.dumps(_auth_cookie_path())
     same_site = _auth_cookie_samesite_attr()
     ss_lit = json.dumps(same_site)
+    domain_lit = _auth_cookie_domain_js_literal()
     html = f"""
 <div style="height:1px;width:1px;overflow:hidden"></div>
 <script>
 (function () {{
   const cookiePath = {path_lit};
+  const domainAttr = {domain_lit};
   const sameSite = {ss_lit};
   var secure = "";
   try {{
@@ -516,7 +728,7 @@ def _clear_auth_cookie() -> None:
       secure = "; Secure";
     }}
   }} catch (e0) {{}}
-  const part = "{_AUTH_COOKIE}=; Path=" + cookiePath + "; Max-Age=0; SameSite=" + sameSite + secure;
+  const part = "{_AUTH_COOKIE}=; Path=" + cookiePath + domainAttr + "; Max-Age=0; SameSite=" + sameSite + secure;
   const apply = function (doc) {{
     try {{ doc.cookie = part; }} catch (e) {{}}
   }};

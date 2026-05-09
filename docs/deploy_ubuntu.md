@@ -166,6 +166,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Cookie $http_cookie;
     }
 
     # Swagger / OpenAPI（在应用根路径，不在 /api/v1 下）
@@ -173,15 +175,21 @@ server {
         proxy_pass http://127.0.0.1:8123/docs;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Cookie $http_cookie;
     }
     location /openapi.json {
         proxy_pass http://127.0.0.1:8123/openapi.json;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Cookie $http_cookie;
     }
 
     # Streamlit（根路径放最后）
@@ -191,12 +199,18 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Cookie $http_cookie;
+        proxy_buffering off;
         proxy_read_timeout 86400;
     }
 }
 ```
+
+若 WebUI 刷新后总回登录页，请确认上述 **`location /`**（及 `/api/v1`）中已包含 **`proxy_set_header Cookie $http_cookie;`** 与 **`X-Forwarded-Host`**；Streamlit 侧 `.env` 中 **`FM_API_BASE`** 须为浏览器同源 HTTPS 地址（如 `https://你的域名/api/v1`）。
 
 启用并重载：
 
