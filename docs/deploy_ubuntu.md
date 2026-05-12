@@ -54,7 +54,8 @@ source .venv/bin/activate
 alembic upgrade head
 ```
 
-之后每次发版若带有新的迁移脚本，在**备份之后**再执行 `alembic upgrade head`（见下文「升级与数据」）。
+发版后若出现 **财产总览或持仓相关接口 500**，且 API 日志中有 **`opened_at`** / **`UndefinedColumn`**：说明库结构落后于代码。在应用目录执行上条 `alembic upgrade head`（会应用含 `positions.opened_at` 在内的迁移；若启动脚本已自动加过该列，迁移内已做存在性判断，可安全执行），然后 **`sudo systemctl restart financial-manager-api.service`**。仍失败时用数据库超级用户执行：  
+`\d positions`（`psql`）确认是否已有 `opened_at`；并查看 **`journalctl -u financial-manager-api.service -n 100 --no-pager`** 中的完整报错。
 
 ## 5. 启动后端（API）
 

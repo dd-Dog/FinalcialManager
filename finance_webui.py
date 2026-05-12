@@ -5,7 +5,7 @@ import html
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -35,8 +35,17 @@ def _api_request_timeout_seconds() -> float:
 
 # 表格/API 中可能为 ISO 的时间字段，展示为 YYYY/MM/DD HH:MM
 TIME_COLUMN_KEYS = frozenset(
-    {"occurred_at", "start_date", "end_date", "created_at", "updated_at", "ref_price_updated_at"}
+    {
+        "occurred_at",
+        "start_date",
+        "end_date",
+        "created_at",
+        "updated_at",
+        "ref_price_updated_at",
+    }
 )
+# 表格中仅展示日期（不含时刻）
+DATE_ONLY_GRID_KEYS = frozenset({"opened_at"})
 
 
 def _user_tzinfo():
@@ -75,6 +84,11 @@ def iso_ts_for_api(s: str) -> str:
     return parse_ts_input(s).isoformat(timespec="seconds")
 
 
+def _pos_opened_date_iso_for_api(d: date) -> str:
+    """所选日历日在本机时区 0 点的 ISO，发给后端作为买入日期锚点。"""
+    return datetime.combine(d, time.min, tzinfo=_user_tzinfo()).isoformat()
+
+
 def _looks_like_datetime_string(s: str) -> bool:
     if len(s) < 10:
         return False
@@ -101,6 +115,25 @@ def format_ts_cell(v: object) -> str:
         return s
 
 
+def format_opened_at_date_cell(v: object) -> str:
+    """买入日期列：本机时区下 YYYY/MM/DD。"""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, datetime):
+        dt = v
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_user_tzinfo()).strftime("%Y/%m/%d")
+    s = str(v).strip()
+    if not _looks_like_datetime_string(s):
+        return s
+    try:
+        dt = parse_ts_input(s)
+    except ValueError:
+        return s
+    return dt.astimezone(_user_tzinfo()).strftime("%Y/%m/%d")
+
+
 def _rows_asset_type_display(rows: list[dict]) -> list[dict]:
     if not rows:
         return rows
@@ -119,6 +152,9 @@ def rows_readable_times(rows: list[dict]) -> list[dict]:
     out: list[dict] = []
     for row in rows:
         d = dict(row)
+        for k in DATE_ONLY_GRID_KEYS:
+            if k in d and d[k] not in (None, ""):
+                d[k] = format_opened_at_date_cell(d[k])
         for k in TIME_COLUMN_KEYS:
             if k in d and d[k] not in (None, ""):
                 d[k] = format_ts_cell(d[k])
@@ -297,6 +333,7 @@ def _dismiss_dialog_delete_asset() -> None:
 
 def _dismiss_dialog_pos_opening() -> None:
     st.session_state.pop("dlg_pos_open", None)
+    st.session_state.pop("dlg_pos_opened_at", None)
 
 
 def _dismiss_dialog_pos_edit() -> None:
@@ -308,6 +345,7 @@ def _dismiss_dialog_pos_edit() -> None:
         "dlg_ep_rp",
         "dlg_pos_edit_account_pick",
         "dlg_pos_edit_replace",
+        "dlg_pos_edit_opened_at",
     ):
         st.session_state.pop(_k, None)
 
@@ -326,8 +364,48 @@ def _dismiss_dialog_transaction_detail() -> None:
 
 
 TX_LIST_PAGE_SIZE = 10
-ASSETS_LIST_PAGE_SIZE = 20
 POSITIONS_HOLDINGS_PAGE_SIZE = 10
+
+
+def _render_pagination_compact_centered(
+    *,
+    page: int,
+    total_pages: int,
+    total: int,
+    page_state_key: str,
+    prev_button_key: str,
+    next_button_key: str,
+) -> None:
+    """上一页、页码说明、下一页成组水平居中，组内间距尽量紧凑。
+
+    用于：证券标的列表、流水买卖列表、持仓在持列表（均在表格下方调用）。"""
+    # 外侧两列作留白，中间带宜窄，避免「上一页 | 说明 | 下一页」在宽带里被拉得过散
+    _sp_l, _sp_c, _sp_r = st.columns([4.0, 2.0, 4.0], gap="small")
+    with _sp_c:
+        # 两侧仅放按钮，中间放说明，压低左右列宽占比以减小组内空隙感
+        g1, g2, g3 = st.columns([0.72, 1.35, 0.72], gap="small", vertical_alignment="center")
+        with g1:
+            if st.button(t("tx_page_prev"), disabled=page <= 1, key=prev_button_key):
+                st.session_state[page_state_key] = page - 1
+                st.rerun()
+        with g2:
+            st.caption(t("tx_page_status", page=page, total_pages=total_pages, total=total))
+        with g3:
+            if st.button(t("tx_page_next"), disabled=page >= total_pages, key=next_button_key):
+                st.session_state[page_state_key] = page + 1
+                st.rerun()
+
+
+def _assets_list_page_size() -> int:
+    """证券标的列表每页条数，默认 15。可用环境变量 ``FM_ASSETS_LIST_PAGE_SIZE`` 覆盖（1～200）。"""
+    raw = os.getenv("FM_ASSETS_LIST_PAGE_SIZE", "").strip()
+    if not raw:
+        return 15
+    try:
+        n = int(raw, 10)
+    except ValueError:
+        return 15
+    return max(1, min(n, 200))
 
 # 登录态 Cookie：整页刷新会新建 Streamlit 会话；优先 ``extra_streamlit_components.CookieManager`` 写主文档 Cookie，
 # 辅以 ``components.html`` 与 ``st.context.cookies`` / ``Cookie`` 请求头兜底。
@@ -1379,17 +1457,23 @@ def inject_app_css() -> None:
     st.markdown(
         """
         <style>
-            /* Streamlit 默认顶栏：Deploy、⋮ 等（本地自用无意义），去掉可消除一大块空白 */
+            /* 顶栏：不可整块 display:none —— 侧栏收起后「展开侧栏」按钮在 stToolbar 内，隐藏后无法再次打开。 */
             header[data-testid="stHeader"] {
-                display: none !important;
+                background: transparent !important;
+                border: none !important;
+                box-shadow: none !important;
+                padding: 0.1rem 0.35rem 0 !important;
+                min-height: 0 !important;
+                height: auto !important;
             }
             div[data-testid="stDecoration"] {
                 display: none !important;
             }
-            /* 其余壳层：工具条、底栏、左下角状态、主题切换、开发时「文件已变/Rerun」条等 */
-            div[data-testid="stToolbar"],
-            [data-testid="stAppToolbar"],
-            [data-testid="stHeaderToolbar"],
+            /* 右侧系统菜单（⋮ 等）；Deploy 等见下方 .stDeployButton */
+            [data-testid="stHeaderToolbar"] {
+                display: none !important;
+            }
+            /* 底栏、状态、主题切换等 */
             [data-testid="stBottom"],
             footer,
             [data-testid="stStatusWidget"],
@@ -1399,6 +1483,13 @@ def inject_app_css() -> None:
             .stDeployButton,
             [data-testid="stToolbarActions"] {
                 display: none !important;
+            }
+            /* 顶栏工具条：透明底，避免再占一条大块色带；保留内联「展开侧栏」图标按钮 */
+            div[data-testid="stToolbar"] {
+                background: transparent !important;
+                border: none !important;
+                padding: 0 !important;
+                min-height: 0 !important;
             }
             /* 主内容区顶距（原 2rem 易显「大白边」） */
             .block-container {
@@ -1527,6 +1618,86 @@ def inject_app_css() -> None:
             }
             section[data-testid="stMain"] .element-container {
                 overflow: visible !important;
+            }
+
+            /* 持仓页：在持列表模糊筛选——行内标签 + 高对比输入框
+               注意：Streamlit ≥1.40 外层为 data-testid="stElementContainer"，「element-container」仅为 class，
+               用 [data-testid="element-container"] 无法命中；须同时匹配 .element-container / stTextInputRootElement。 */
+            section[data-testid="stMain"] .fm-pos-holdings-filter-lbl {
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+                min-height: 0;
+                height: 100%;
+                padding: 0 0.15rem 0 0;
+                margin: 0;
+                white-space: nowrap;
+                font-size: 0.88rem;
+                font-weight: 600;
+                color: #1e293b;
+                line-height: 1.35;
+            }
+            /* 筛选组内：标签列与输入列相对垂直居中（抵消 Markdown 外包层默认留白） */
+            section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.fm-pos-holdings-filter-lbl) {
+                align-items: stretch !important;
+            }
+            section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.fm-pos-holdings-filter-lbl) > div[data-testid="stColumn"] {
+                display: flex !important;
+                flex-direction: column !important;
+                justify-content: center !important;
+            }
+            section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.fm-pos-holdings-filter-lbl) [data-testid="stMarkdownContainer"] {
+                margin: 0 !important;
+                padding: 0 !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: flex-end !important;
+                min-height: 0 !important;
+            }
+            section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(.fm-pos-holdings-filter-lbl) [data-testid="stMarkdownContainer"] p {
+                margin: 0 !important;
+                padding: 0 !important;
+                line-height: 1.35 !important;
+            }
+            section[data-testid="stMain"] [data-testid="stHorizontalBlock"]:has(div[class*="st-key-pos_holdings_filter_"]) {
+                align-items: center !important;
+            }
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"],
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] {
+                margin-top: 0 !important;
+                margin-bottom: 0.15rem !important;
+            }
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"] [data-testid="stTextInputRootElement"],
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] [data-testid="stTextInputRootElement"],
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"] [data-baseweb="input"],
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"] [data-baseweb="input"] {
+                background-color: #eff6ff !important;
+                border: 1.5px solid #2563eb !important;
+                border-radius: 8px !important;
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45) !important;
+            }
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"]:focus-within [data-testid="stTextInputRootElement"],
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"]:focus-within [data-testid="stTextInputRootElement"],
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"]:focus-within [data-baseweb="input"],
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"]:focus-within [data-baseweb="input"] {
+                border-color: #1d4ed8 !important;
+                box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.5) !important;
+            }
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"] input,
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] [data-testid="stTextInput"] input {
+                background-color: transparent !important;
+                color: #0f172a !important;
+                font-size: 0.8125rem !important;
+                line-height: 1.35 !important;
+            }
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"] [data-testid="InputInstructions"],
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] [data-testid="InputInstructions"] {
+                font-size: 0.68rem !important;
+                line-height: 1.2 !important;
+            }
+            section[data-testid="stMain"] div.element-container[class*="st-key-pos_holdings_filter_"] [data-testid="InputInstructions"] span,
+            section[data-testid="stMain"] div[data-testid="stElementContainer"][class*="st-key-pos_holdings_filter_"] [data-testid="InputInstructions"] span {
+                font-size: inherit !important;
             }
 
             /* ---------- 左侧栏：高对比、与登录页一致的科技风 ---------- */
@@ -2893,7 +3064,7 @@ def render_assets_panel() -> None:
     if ok and isinstance(result, dict):
         items = result.get("data", {}).get("items", []) or []
         st.subheader(t("sub_asset_list"))
-        page_size = ASSETS_LIST_PAGE_SIZE
+        page_size = _assets_list_page_size()
         page_req = max(1, int(st.session_state.get("assets_list_page", 1) or 1))
         n = len(items)
         total_pages = max(1, (n + page_size - 1) // page_size) if n else 1
@@ -2907,18 +3078,6 @@ def render_assets_panel() -> None:
         st.session_state["_fm_assets_list_page"] = page
 
         if items:
-            p1, p2, p3 = st.columns([1, 2, 1])
-            with p1:
-                if st.button(t("tx_page_prev"), disabled=page <= 1, key="ast_list_prev"):
-                    st.session_state["assets_list_page"] = page - 1
-                    st.rerun()
-            with p2:
-                st.caption(t("tx_page_status", page=page, total_pages=total_pages, total=n))
-            with p3:
-                if st.button(t("tx_page_next"), disabled=page >= total_pages, key="ast_list_next"):
-                    st.session_state["assets_list_page"] = page + 1
-                    st.rerun()
-
             start = (page - 1) * page_size
             page_items = items[start : start + page_size]
             _consume_assets_grid_row_pick(page_items)
@@ -2933,6 +3092,14 @@ def render_assets_panel() -> None:
                 on_select="rerun",
                 selection_mode="single-row",
                 key=_FM_ASSETS_GRID_KEY,
+            )
+            _render_pagination_compact_centered(
+                page=page,
+                total_pages=total_pages,
+                total=n,
+                page_state_key="assets_list_page",
+                prev_button_key="ast_list_prev",
+                next_button_key="ast_list_next",
             )
         else:
             st.session_state["assets_list_page"] = 1
@@ -3109,18 +3276,6 @@ def render_transactions_panel() -> None:
             st.info(t("info_no_recent_tx"))
         else:
             opened_from_url = _consume_tx_detail_query_param()
-            p1, p2, p3 = st.columns([1, 2, 1])
-            with p1:
-                if st.button(t("tx_page_prev"), disabled=page <= 1, key="tx_list_prev"):
-                    st.session_state["tx_list_page"] = page - 1
-                    st.rerun()
-            with p2:
-                st.caption(t("tx_page_status", page=page, total_pages=total_pages, total=total))
-            with p3:
-                if st.button(t("tx_page_next"), disabled=page >= total_pages, key="tx_list_next"):
-                    st.session_state["tx_list_page"] = page + 1
-                    st.rerun()
-
             accounts = fetch_accounts()
             assets = fetch_assets()
             display_rows = _transactions_rows_for_display(
@@ -3140,6 +3295,14 @@ def render_transactions_panel() -> None:
                 on_select="rerun",
                 selection_mode="single-row",
                 key=_fm_tx_list_df_state_key(),
+            )
+            _render_pagination_compact_centered(
+                page=page,
+                total_pages=total_pages,
+                total=total,
+                page_state_key="tx_list_page",
+                prev_button_key="tx_list_prev",
+                next_button_key="tx_list_next",
             )
             _apply_tx_list_row_selection_to_detail(
                 items, skip_if_query_opened=opened_from_url
@@ -3235,7 +3398,7 @@ def _dialog_opening_position() -> None:
     st.subheader(t("pos_dlg_opening_title"))
     st.caption(t("pos_dlg_help"))
     if st.button(t("dlg_close"), key="dlg_pos_close"):
-        st.session_state.pop("dlg_pos_open", None)
+        _dismiss_dialog_pos_opening()
         st.rerun()
 
     accounts = fetch_accounts()
@@ -3304,6 +3467,12 @@ def _dialog_opening_position() -> None:
             format="%.2f",
             key="dlg_pos_realized",
         )
+        st.caption(t("pos_dlg_opened_date_hint"))
+        st.date_input(
+            t("pos_dlg_opened_at"),
+            value=datetime.now(_user_tzinfo()).date(),
+            key="dlg_pos_opened_at",
+        )
         st.checkbox(t("pos_dlg_replace"), key="dlg_pos_replace")
         submitted = st.form_submit_button(t("pos_dlg_save"))
 
@@ -3322,6 +3491,11 @@ def _dialog_opening_position() -> None:
         st.error(t("err_pos_qty_cost"))
         return
 
+    opened_raw = st.session_state.get("dlg_pos_opened_at")
+    if not isinstance(opened_raw, date):
+        st.error(t("err_pos_opening_generic"))
+        return
+
     ok, result = api_call(
         "POST",
         "/positions/opening",
@@ -3332,11 +3506,12 @@ def _dialog_opening_position() -> None:
             "avg_cost": a_s,
             "realized_pnl": r_s,
             "replace_existing": bool(st.session_state.get("dlg_pos_replace", False)),
+            "opened_at": _pos_opened_date_iso_for_api(opened_raw),
         },
     )
     if ok:
         st.success(t("pos_ok_saved"))
-        st.session_state.pop("dlg_pos_open", None)
+        _dismiss_dialog_pos_opening()
         st.rerun()
     st.error(_friendly_pos_opening_error(result))
     return
@@ -3389,6 +3564,19 @@ def _dialog_edit_position() -> None:
                 st.session_state["dlg_pos_edit_account_pick"] = pick_lbl
         if "dlg_pos_edit_account_pick" not in st.session_state:
             st.session_state["dlg_pos_edit_account_pick"] = acc_keys[0]
+        raw_oa = row.get("opened_at")
+        if raw_oa:
+            try:
+                iso = str(raw_oa).replace("Z", "+00:00")
+                odt = datetime.fromisoformat(iso)
+                if odt.tzinfo is None:
+                    odt = odt.replace(tzinfo=timezone.utc)
+                d_open = odt.astimezone(_user_tzinfo()).date()
+            except ValueError:
+                d_open = datetime.now(_user_tzinfo()).date()
+        else:
+            d_open = datetime.now(_user_tzinfo()).date()
+        st.session_state["dlg_pos_edit_opened_at"] = d_open
 
     if st.session_state.get("dlg_pos_edit_asset_pick") not in ids:
         st.session_state["dlg_pos_edit_asset_pick"] = ids[0]
@@ -3433,6 +3621,11 @@ def _dialog_edit_position() -> None:
             options=acc_keys,
             key="dlg_pos_edit_account_pick",
         )
+        st.caption(t("pos_dlg_opened_date_hint"))
+        st.date_input(
+            t("pos_dlg_opened_at"),
+            key="dlg_pos_edit_opened_at",
+        )
         st.checkbox(t("pos_dlg_replace"), key="dlg_pos_edit_replace")
         submitted = st.form_submit_button(t("dlg_save"))
 
@@ -3464,6 +3657,11 @@ def _dialog_edit_position() -> None:
         st.error(t("err_pos_qty_cost"))
         return
 
+    opened_edit = st.session_state.get("dlg_pos_edit_opened_at")
+    if not isinstance(opened_edit, date):
+        st.error(t("err_pos_opening_generic"))
+        return
+
     rep = bool(st.session_state.get("dlg_pos_edit_replace", False))
     params = {"replace_existing": "true"} if rep else None
     ok2, res2 = api_call(
@@ -3474,6 +3672,7 @@ def _dialog_edit_position() -> None:
             "quantity": q_s,
             "avg_cost": a_s,
             "realized_pnl": r_s,
+            "opened_at": _pos_opened_date_iso_for_api(opened_edit),
         },
         params=params,
     )
@@ -3514,6 +3713,157 @@ def _holdings_book_by_type_dict(data: dict, holdings: list[dict]) -> dict[str, s
         return f"{v.quantize(Decimal('0.01')):.2f}"
 
     return {"fund": q(f), "stock": q(s), "other": q(o)}
+
+
+def _holdings_cumulative_floating_pnl_by_type(holdings: list[dict]) -> dict[str, str]:
+    """按 fund / stock / other 汇总持仓行的浮动盈亏（与表内「浮动盈亏」列一致）。"""
+    from decimal import Decimal
+
+    f = s = o = Decimal(0)
+    for r in holdings:
+        raw = r.get("floating_pnl")
+        if raw is None or raw == "":
+            continue
+        try:
+            pnl = Decimal(str(raw).replace(",", "").strip())
+        except (ArithmeticError, ValueError, TypeError):
+            continue
+        at = str(r.get("asset_type") or "").strip().lower()
+        if at == "fund":
+            f += pnl
+        elif at == "stock":
+            s += pnl
+        else:
+            o += pnl
+
+    def q(v: Decimal) -> str:
+        return f"{v.quantize(Decimal('0.01')):.2f}"
+
+    return {"fund": q(f), "stock": q(s), "other": q(o)}
+
+
+def _floating_pnl_cell_css(v: object) -> str:
+    """浮动盈亏 / 收益率等列样式：红为正、绿为负（A 股习惯）。"""
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    s = str(v).strip()
+    if s in ("", "-", "--", "—"):
+        return ""
+    if s.endswith("%"):
+        s = s[:-1].strip()
+    try:
+        from decimal import Decimal
+
+        d = Decimal(s.replace(",", ""))
+    except (ArithmeticError, ValueError, TypeError):
+        return ""
+    if d > 0:
+        return "color: #dc2626"
+    if d < 0:
+        return "color: #16a34a"
+    return ""
+
+
+def _pnl_amount_html_for_summary(amount_str: str) -> str:
+    """持仓摘要里盈亏数字：正红负绿，返回可嵌入 ``t(...).format`` 的 HTML 片段（数值已转义）。"""
+    esc = html.escape(str(amount_str).strip())
+    try:
+        from decimal import Decimal
+
+        d = Decimal(str(amount_str).replace(",", "").strip())
+    except (ArithmeticError, ValueError, TypeError):
+        return esc
+    if d > 0:
+        return f'<span style="color:#dc2626;font-weight:600">{esc}</span>'
+    if d < 0:
+        return f'<span style="color:#16a34a;font-weight:600">{esc}</span>'
+    return esc
+
+
+def _holdings_grid_with_floating_pnl_style(
+    df: pd.DataFrame,
+    floating_pnl_col: str,
+    *,
+    yield_pct_col: str | None = None,
+    annualized_yield_col: str | None = None,
+) -> object:
+    """为「浮动盈亏」「收益率」「年化」等着色；列缺失或空表则退回普通 DataFrame。"""
+    if df.empty or floating_pnl_col not in df.columns:
+        return df
+    styled = {floating_pnl_col}
+    if yield_pct_col and yield_pct_col in df.columns:
+        styled.add(yield_pct_col)
+    if annualized_yield_col and annualized_yield_col in df.columns:
+        styled.add(annualized_yield_col)
+
+    def _style_column(col: pd.Series) -> list[str]:
+        if col.name not in styled:
+            return [""] * len(col)
+        return [_floating_pnl_cell_css(x) for x in col]
+
+    return df.style.apply(_style_column, axis=0).hide(axis="index")
+
+
+def _ensure_holdings_yield_pct(rows: list[dict]) -> None:
+    """旧版 API 或未返回 ``yield_pct`` 时，按 浮动盈亏/成本金额×100% 补算。"""
+    from decimal import Decimal
+
+    for r in rows:
+        raw_y = r.get("yield_pct")
+        if raw_y is not None and str(raw_y).strip() not in ("", "None"):
+            continue
+        fp = r.get("floating_pnl")
+        cost = r.get("cost_amount")
+        if fp is None or fp == "" or cost is None or str(cost).strip() in ("", "0", "0.00", "0.0"):
+            r["yield_pct"] = None
+            continue
+        try:
+            fp_d = Decimal(str(fp).replace(",", "").strip())
+            c_d = Decimal(str(cost).replace(",", "").strip())
+            if c_d <= Decimal("0.01"):
+                r["yield_pct"] = None
+            else:
+                r["yield_pct"] = f"{(fp_d / c_d * Decimal('100')).quantize(Decimal('0.01')):.2f}%"
+        except (ArithmeticError, ValueError, TypeError):
+            r["yield_pct"] = None
+
+
+def _holdings_row_matches_fuzzy(
+    row: dict,
+    *,
+    q_account: str,
+    q_asset_type: str,
+    q_symbol: str,
+    q_name: str,
+) -> bool:
+    """持仓表行是否匹配四个模糊条件；空字符串表示该列不参与筛选。"""
+
+    def _needle_in(needle: str, *haystacks: object) -> bool:
+        n = (needle or "").strip()
+        if not n:
+            return True
+        n_low = n.casefold()
+        for h in haystacks:
+            s = str(h or "")
+            if n_low in s.casefold():
+                return True
+        return False
+
+    if not _needle_in(q_account, row.get("cash_account")):
+        return False
+
+    at_raw = str(row.get("asset_type") or "").strip()
+    at_label = asset_type_label(at_raw) if at_raw else ""
+    if not _needle_in(q_asset_type, at_raw, at_label):
+        return False
+
+    if not _needle_in(q_symbol, row.get("symbol")):
+        return False
+    if not _needle_in(q_name, row.get("name")):
+        return False
+    return True
 
 
 def render_positions_panel() -> None:
@@ -3561,22 +3911,37 @@ def render_positions_panel() -> None:
                     d = {k: v for k, v in row.items() if k != "realized_pnl"}
                     d.setdefault("last_price", None)
                     d.setdefault("floating_pnl", None)
+                    d.setdefault("yield_pct", None)
+                    d.setdefault("annualized_yield", None)
                     holdings.append(d)
+
+        _ensure_holdings_yield_pct(holdings)
 
         if not holdings and not recent_sells and not items_all:
             st.info(t("info_no_positions_simple"))
         else:
             hsum = _holdings_book_by_type_dict(data, holdings)
-            sum_line = t("pos_hold_type_totals", fund=hsum["fund"], stock=hsum["stock"])
+            psum = _holdings_cumulative_floating_pnl_by_type(holdings)
+            sum_line = t(
+                "pos_hold_type_totals",
+                fund=html.escape(hsum["fund"]),
+                stock=html.escape(hsum["stock"]),
+                fund_pnl=_pnl_amount_html_for_summary(psum["fund"]),
+                stock_pnl=_pnl_amount_html_for_summary(psum["stock"]),
+            )
             try:
                 from decimal import Decimal
 
                 if Decimal(str(hsum.get("other", "0.00")).replace(",", "")) > Decimal("0.005"):
-                    sum_line += t("pos_hold_type_other_suffix", other=hsum["other"])
+                    sum_line += t(
+                        "pos_hold_type_other_suffix",
+                        other=html.escape(hsum["other"]),
+                        other_pnl=_pnl_amount_html_for_summary(psum["other"]),
+                    )
             except (ArithmeticError, ValueError, TypeError):
                 pass
             _ttl = html.escape(t("pos_sub_holding"))
-            _sum = html.escape(sum_line)
+            _sum = sum_line
             st.markdown(
                 f'<div style="display:flex;flex-wrap:wrap;align-items:baseline;column-gap:0.75rem;row-gap:0.25rem;'
                 f'margin:0 0 0.35rem 0;">'
@@ -3587,35 +3952,118 @@ def render_positions_panel() -> None:
             )
             if holdings:
                 st.caption(t("pos_cap_hold_quote_hint"))
+                st.caption(t("pos_cap_annualized_hint"))
+                st.caption(t("pos_holdings_filter_hint"))
+                _g0, _g1, _g2, _g3 = st.columns([1, 1, 1, 1], gap="medium", vertical_alignment="center")
+                with _g0:
+                    _la, _ia = st.columns([0.42, 1.0], gap="small", vertical_alignment="center")
+                    with _la:
+                        st.markdown(
+                            f'<div class="fm-pos-holdings-filter-lbl"><span>{html.escape(t("col_cash_account"))}</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                    with _ia:
+                        q_acc = st.text_input(
+                            "pos_holdings_filter_account_lbl",
+                            key="pos_holdings_filter_account",
+                            label_visibility="collapsed",
+                            max_chars=128,
+                        )
+                with _g1:
+                    _lt, _it = st.columns([0.42, 1.0], gap="small", vertical_alignment="center")
+                    with _lt:
+                        st.markdown(
+                            f'<div class="fm-pos-holdings-filter-lbl"><span>{html.escape(t("col_asset_type"))}</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                    with _it:
+                        q_at = st.text_input(
+                            "pos_holdings_filter_asset_type_lbl",
+                            key="pos_holdings_filter_asset_type",
+                            label_visibility="collapsed",
+                            max_chars=64,
+                        )
+                with _g2:
+                    _ls, _is = st.columns([0.42, 1.0], gap="small", vertical_alignment="center")
+                    with _ls:
+                        st.markdown(
+                            f'<div class="fm-pos-holdings-filter-lbl"><span>{html.escape(t("col_symbol"))}</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                    with _is:
+                        q_sym = st.text_input(
+                            "pos_holdings_filter_symbol_lbl",
+                            key="pos_holdings_filter_symbol",
+                            label_visibility="collapsed",
+                            max_chars=32,
+                        )
+                with _g3:
+                    _ln, _name_in = st.columns([0.42, 1.0], gap="small", vertical_alignment="center")
+                    with _ln:
+                        st.markdown(
+                            f'<div class="fm-pos-holdings-filter-lbl"><span>{html.escape(t("col_name"))}</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                    with _name_in:
+                        q_nm = st.text_input(
+                            "pos_holdings_filter_name_lbl",
+                            key="pos_holdings_filter_name",
+                            label_visibility="collapsed",
+                            max_chars=128,
+                        )
+                _fsig = (str(q_acc).strip(), str(q_at).strip(), str(q_sym).strip(), str(q_nm).strip())
+                if st.session_state.get("_pos_holdings_fsig") != _fsig:
+                    st.session_state["_pos_holdings_fsig"] = _fsig
+                    st.session_state["pos_holdings_page"] = 1
+
+                holdings_view = [
+                    r
+                    for r in holdings
+                    if _holdings_row_matches_fuzzy(
+                        r,
+                        q_account=q_acc,
+                        q_asset_type=q_at,
+                        q_symbol=q_sym,
+                        q_name=q_nm,
+                    )
+                ]
                 ph_size = POSITIONS_HOLDINGS_PAGE_SIZE
-                n_h = len(holdings)
-                total_pages = max(1, (n_h + ph_size - 1) // ph_size) if n_h else 1
-                page_req = max(1, int(st.session_state.get("pos_holdings_page", 1) or 1))
-                page = min(page_req, total_pages)
-                if page_req > total_pages:
-                    st.session_state["pos_holdings_page"] = total_pages
-                    st.rerun()
-
-                p1, p2, p3 = st.columns([1, 2, 1])
-                with p1:
-                    if st.button(t("tx_page_prev"), disabled=page <= 1, key="pos_holdings_prev"):
-                        st.session_state["pos_holdings_page"] = page - 1
-                        st.rerun()
-                with p2:
-                    st.caption(t("tx_page_status", page=page, total_pages=total_pages, total=n_h))
-                with p3:
-                    if st.button(t("tx_page_next"), disabled=page >= total_pages, key="pos_holdings_next"):
-                        st.session_state["pos_holdings_page"] = page + 1
+                n_h = len(holdings_view)
+                if not holdings_view:
+                    st.session_state["pos_holdings_page"] = 1
+                    st.info(t("info_no_holdings_filter_match"))
+                else:
+                    total_pages = max(1, (n_h + ph_size - 1) // ph_size) if n_h else 1
+                    page_req = max(1, int(st.session_state.get("pos_holdings_page", 1) or 1))
+                    page = min(page_req, total_pages)
+                    if page_req > total_pages:
+                        st.session_state["pos_holdings_page"] = total_pages
                         st.rerun()
 
-                start = (page - 1) * ph_size
-                page_holdings = holdings[start : start + ph_size]
-                st.dataframe(
-                    prepare_grid_rows(page_holdings, drop_keys=frozenset({"account_id", "asset_id"})),
-                    use_container_width=True,
-                    hide_index=True,
-                    height="content",
-                )
+                    start = (page - 1) * ph_size
+                    page_holdings = holdings_view[start : start + ph_size]
+                    _grid_df = pd.DataFrame(
+                        prepare_grid_rows(page_holdings, drop_keys=frozenset({"account_id", "asset_id"}))
+                    )
+                    _fp_col = t("col_floating_pnl")
+                    _yld_col = t("col_yield_pct")
+                    _ann_col = t("col_annualized_yield")
+                    st.dataframe(
+                        _holdings_grid_with_floating_pnl_style(
+                            _grid_df, _fp_col, yield_pct_col=_yld_col, annualized_yield_col=_ann_col
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                        height="content",
+                    )
+                    _render_pagination_compact_centered(
+                        page=page,
+                        total_pages=total_pages,
+                        total=n_h,
+                        page_state_key="pos_holdings_page",
+                        prev_button_key="pos_holdings_prev",
+                        next_button_key="pos_holdings_next",
+                    )
             else:
                 st.session_state["pos_holdings_page"] = 1
                 st.caption(t("info_no_holdings_sub"))

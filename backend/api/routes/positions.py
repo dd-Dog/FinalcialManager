@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -15,6 +15,32 @@ from backend.schemas.positions import PositionUpdateRequest, UpsertOpeningPositi
 router = APIRouter()
 
 _QTY_EPS = Decimal("1e-9")
+# 年化分母不低于 1「日」等价，避免持有仅数小时时节分母过小、简单年化仍爆炸。
+_MIN_DAYS_DENOM_FOR_ANNUALIZED = Decimal("1")
+
+
+def _opened_at_client_instant_utc(dt: datetime) -> datetime:
+    """Web/API 传入的「日历日 0 点」时刻：保留该绝对时刻，仅归零微秒并落到 UTC。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(microsecond=0)
+
+
+def _opened_at_default_new_position_utc() -> datetime:
+    """补录新开仓且未传 opened_at：当前 UTC 日历日的 00:00:00 UTC。"""
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _opened_at_from_trade_occurred_at(dt: datetime) -> datetime:
+    """证券买入流水上的 occurred_at → 该时刻所在时区的「日历日」0 点，再存 UTC。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone(dt.tzinfo)
+    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc).replace(microsecond=0)
 
 
 def _trade_tx_count(db: Session, user_id: int, asset_id: int) -> int:
@@ -42,6 +68,43 @@ def _dec_close(a: object, b: object) -> bool:
     return abs(Decimal(str(a)) - Decimal(str(b))) < Decimal("1e-8")
 
 
+def _annualized_yield_pct_str(
+    fp_dec: Decimal,
+    cost_d: Decimal,
+    anchor: datetime,
+    now: datetime,
+) -> str | None:
+    """简单年化：``(浮动盈亏 / 成本) × (365 / 持有天数)``。
+
+    持有天数 = 买入锚点到当前 UTC 的经过时间（秒 / 86400）；分母取
+    ``max(持有天数, _MIN_DAYS_DENOM_FOR_ANNUALIZED)``，避免不足 1 天时节分母过小。
+
+    旧实现为复利 ``(1+r)^(365/d)-1`` 且 ``d`` 取「日历日差、至少 1」，短持有会把中等 ``r`` 放大到数十万 %。
+    """
+    if cost_d <= Decimal("0.01"):
+        return None
+    r = fp_dec / cost_d
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    else:
+        anchor = anchor.astimezone(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    elapsed_sec = (now - anchor).total_seconds()
+    if elapsed_sec <= 0:
+        return None
+    elapsed_days = Decimal(str(elapsed_sec / 86400.0))
+    denom = max(elapsed_days, _MIN_DAYS_DENOM_FOR_ANNUALIZED)
+    try:
+        ann = r * (Decimal(365) / denom)
+        ann_pct = ann * Decimal(100)
+        return dec2(ann_pct) + "%"
+    except (ArithmeticError, InvalidOperation, ValueError):
+        return None
+
+
 @router.get("", response_model=APIResponse)
 def list_positions(
     asset_type: str | None = Query(default=None),
@@ -62,6 +125,22 @@ def list_positions(
         query = query.where(Asset.symbol == symbol)
 
     rows = db.execute(query).all()
+    now_utc = datetime.now(timezone.utc)
+    asset_ids = list({asset.id for _pos, asset, _acc in rows})
+    first_buy_at: dict[int, datetime] = {}
+    if asset_ids:
+        fb_rows = db.execute(
+            select(Transaction.asset_id, func.min(Transaction.occurred_at))
+            .where(
+                Transaction.user_id == current_user.id,
+                Transaction.type == "buy",
+                Transaction.asset_id.in_(asset_ids),
+            )
+            .group_by(Transaction.asset_id)
+        ).all()
+        for aid, ts in fb_rows:
+            if ts is not None:
+                first_buy_at[int(aid)] = ts
 
     def _cash_account_label(acc: Account | None) -> str | None:
         if acc is None:
@@ -83,6 +162,14 @@ def list_positions(
             lp_dec = Decimal(str(asset.ref_last_price))
             fp_dec = qty_d * (lp_dec - ac_d)
 
+        cost_d = qty_d * ac_d
+        yield_pct_str: str | None = None
+        annualized_str: str | None = None
+        if fp_dec is not None and cost_d > Decimal("0.01"):
+            yield_pct_str = dec2((fp_dec / cost_d) * Decimal("100")) + "%"
+            anchor = position.opened_at or first_buy_at.get(asset.id) or position.updated_at
+            annualized_str = _annualized_yield_pct_str(fp_dec, cost_d, anchor, now_utc)
+
         ca_lbl = _cash_account_label(account)
         item_row = {
             "cash_account": ca_lbl,
@@ -97,6 +184,9 @@ def list_positions(
             "realized_pnl": dec2(position.realized_pnl),
             "last_price": dec2_opt(lp_dec) if lp_dec is not None else None,
             "floating_pnl": dec2_opt(fp_dec) if fp_dec is not None else None,
+            "yield_pct": yield_pct_str,
+            "annualized_yield": annualized_str,
+            "opened_at": position.opened_at.isoformat() if position.opened_at else None,
         }
         items.append(item_row)
 
@@ -182,6 +272,11 @@ def upsert_opening_position(
     c = Decimal(payload.avg_cost)
     rp = Decimal(payload.realized_pnl)
 
+    opened_stored = (
+        _opened_at_client_instant_utc(payload.opened_at)
+        if payload.opened_at is not None
+        else _opened_at_default_new_position_utc()
+    )
     if position is None:
         position = Position(
             user_id=current_user.id,
@@ -190,6 +285,7 @@ def upsert_opening_position(
             quantity=q,
             avg_cost=c,
             realized_pnl=rp,
+            opened_at=opened_stored,
         )
         db.add(position)
     else:
@@ -198,6 +294,8 @@ def upsert_opening_position(
         position.realized_pnl = rp
         position.account_id = cust.id
         position.updated_at = datetime.now(timezone.utc)
+        if payload.opened_at is not None:
+            position.opened_at = _opened_at_client_instant_utc(payload.opened_at)
 
     db.commit()
     db.refresh(position)
@@ -208,6 +306,7 @@ def upsert_opening_position(
             "quantity": dec2(position.quantity),
             "avg_cost": dec2(position.avg_cost),
             "realized_pnl": dec2(position.realized_pnl),
+            "opened_at": position.opened_at.isoformat() if position.opened_at else None,
         }
     )
 
@@ -254,6 +353,11 @@ def update_position_by_asset(
     position.realized_pnl = Decimal(payload.realized_pnl)
     position.account_id = cust.id
     position.updated_at = datetime.now(timezone.utc)
+    upd = payload.model_dump(exclude_unset=True)
+    if "opened_at" in upd:
+        position.opened_at = (
+            _opened_at_client_instant_utc(upd["opened_at"]) if upd["opened_at"] is not None else None
+        )
 
     db.commit()
     db.refresh(position)
@@ -264,5 +368,6 @@ def update_position_by_asset(
             "quantity": dec2(position.quantity),
             "avg_cost": dec2(position.avg_cost),
             "realized_pnl": dec2(position.realized_pnl),
+            "opened_at": position.opened_at.isoformat() if position.opened_at else None,
         }
     )

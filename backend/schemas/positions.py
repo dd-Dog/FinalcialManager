@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -12,6 +13,10 @@ class UpsertOpeningPositionRequest(BaseModel):
     avg_cost: Decimal = Field(gt=0)
     realized_pnl: Decimal = Field(default=Decimal("0"))
     replace_existing: bool = False
+    opened_at: datetime | None = Field(
+        default=None,
+        description="买入日期：客户端为该日历日 0 点（本机时区）的 ISO8601；省略则用当前 UTC 日历日 0 点。",
+    )
 
 
 class PositionUpdateRequest(BaseModel):
@@ -21,3 +26,7 @@ class PositionUpdateRequest(BaseModel):
     quantity: Decimal = Field(gt=0)
     avg_cost: Decimal = Field(gt=0)
     realized_pnl: Decimal = Field(default=Decimal("0"))
+    opened_at: datetime | None = Field(
+        default=None,
+        description="买入日期（日历日 0 点，ISO8601）；省略则保持数据库原值。",
+    )

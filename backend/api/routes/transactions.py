@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from backend.api.routes.positions import _opened_at_from_trade_occurred_at
 from backend.auth.deps import get_current_user
 from backend.core.formatting import dec2, dec2_opt
 from backend.db.session import get_db
@@ -200,6 +201,7 @@ def create_transaction(
                 quantity=Decimal("0"),
                 avg_cost=Decimal("0"),
                 realized_pnl=Decimal("0"),
+                opened_at=_opened_at_from_trade_occurred_at(payload.occurred_at) if payload.type == "buy" else None,
             )
             db.add(position)
             db.flush()

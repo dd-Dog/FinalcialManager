@@ -92,6 +92,8 @@ class Position(Base):
     quantity: Mapped[float] = mapped_column(Numeric(18, 6), default=0, nullable=False)
     avg_cost: Mapped[float] = mapped_column(Numeric(18, 6), default=0, nullable=False)
     realized_pnl: Mapped[float] = mapped_column(Numeric(18, 2), default=0, nullable=False)
+    # 用户录入的「实际成交/确认日」0 点（本机时区发出）；年化等优先于此，其次最早 buy 流水、再其次 updated_at
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
