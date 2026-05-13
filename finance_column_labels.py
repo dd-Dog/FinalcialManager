@@ -14,6 +14,8 @@ _COLUMN_I18N_KEYS: frozenset[str] = frozenset(
         "bank_code",
         "currency",
         "balance",
+        "holdings_value",
+        "total_assets",
         "is_active",
         "asset_id",
         "asset_type",

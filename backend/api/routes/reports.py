@@ -6,6 +6,7 @@ from sqlalchemy import case, extract, func, select
 from sqlalchemy.orm import Session
 
 from backend.auth.deps import get_current_user
+from backend.core.account_holdings_agg import account_holdings_market_value_map
 from backend.core.formatting import dec2, dec2_opt
 from backend.db.session import get_db
 from backend.models.entities import Account, Asset, Position, Transaction, User
@@ -52,20 +53,28 @@ def wealth_overview(
             other_book += bv
     book = fund_book + stock_book + other_book
 
-    accounts_out = [
-        {
-            "id": a.id,
-            "name": a.name,
-            "account_type": a.account_type,
-            "balance": dec2(a.balance),
-            "currency": a.currency,
-        }
-        for a in db.scalars(
-            select(Account)
-            .where(Account.user_id == current_user.id, Account.is_active.is_(True))
-            .order_by(Account.id.desc())
-        ).all()
-    ]
+    acc_rows = db.scalars(
+        select(Account)
+        .where(Account.user_id == current_user.id, Account.is_active.is_(True))
+        .order_by(Account.id.desc())
+    ).all()
+    hv_map = account_holdings_market_value_map(db, current_user.id)
+    accounts_out = []
+    for a in acc_rows:
+        bal = Decimal(str(a.balance or 0))
+        hv = hv_map.get(int(a.id), Decimal(0))
+        tot = bal + hv
+        accounts_out.append(
+            {
+                "id": a.id,
+                "name": a.name,
+                "account_type": a.account_type,
+                "balance": dec2(a.balance),
+                "holdings_value": dec2(hv),
+                "total_assets": dec2(tot),
+                "currency": a.currency,
+            }
+        )
 
     grand = cash_total + book
 

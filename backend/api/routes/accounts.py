@@ -7,6 +7,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from backend.auth.deps import get_current_user
+from backend.core.account_holdings_agg import account_holdings_market_value_map
 from backend.core.cn_banks import CHINESE_BANK_CATALOG
 from backend.core.formatting import dec2
 from backend.db.session import get_db
@@ -28,19 +29,26 @@ def list_accounts(
     current_user: User = Depends(get_current_user),
 ) -> APIResponse:
     accounts = db.scalars(select(Account).where(Account.user_id == current_user.id).order_by(Account.id.desc())).all()
-    items = [
-        {
-            "id": account.id,
-            "name": account.name,
-            "account_type": account.account_type,
-            "owner_name": account.owner_name,
-            "bank_code": account.bank_code,
-            "currency": account.currency,
-            "balance": dec2(account.balance),
-            "is_active": account.is_active,
-        }
-        for account in accounts
-    ]
+    hv_map = account_holdings_market_value_map(db, current_user.id)
+    items = []
+    for account in accounts:
+        bal = Decimal(str(account.balance or 0))
+        hv = hv_map.get(int(account.id), Decimal(0))
+        tot = bal + hv
+        items.append(
+            {
+                "id": account.id,
+                "name": account.name,
+                "account_type": account.account_type,
+                "owner_name": account.owner_name,
+                "bank_code": account.bank_code,
+                "balance": dec2(account.balance),
+                "holdings_value": dec2(hv),
+                "total_assets": dec2(tot),
+                "currency": account.currency,
+                "is_active": account.is_active,
+            }
+        )
     return APIResponse(data={"items": items})
 
 

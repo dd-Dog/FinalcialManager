@@ -415,6 +415,7 @@ def _assets_list_page_size() -> int:
 # ``FM_AUTH_COOKIE_SAMESITE=none``（仅 HTTPS，且自动带 Secure）；④ 多子域共享登录态时配置
 # ``FM_AUTH_COOKIE_DOMAIN``（如 ``.example.com``）；⑤ ``FM_API_BASE`` 指向错误后端导致首屏 401 会清 Cookie。
 _AUTH_COOKIE = "fm_auth"
+_FM_UI_LANG_COOKIE = "fm_ui_lang"
 _FM_AUTH_COOKIE_MGR_KEY = "fm_auth_cookie_mgr_esc"
 
 
@@ -679,6 +680,160 @@ def _fm_auth_raw_from_request_cookie_header() -> str | None:
     return None
 
 
+def _read_ui_lang_from_query() -> str | None:
+    try:
+        raw = st.query_params.get("lang")
+        if raw is None:
+            return None
+        v = raw[0] if isinstance(raw, (list, tuple)) else str(raw)
+        v = str(v).strip().lower()
+        return v if v in ("zh", "en") else None
+    except Exception:
+        return None
+
+
+def _read_ui_lang_cookie_value() -> str | None:
+    try:
+        if hasattr(st, "context") and hasattr(st.context, "cookies"):
+            c = st.context.cookies
+            g = getattr(c, "get", None)
+            if callable(g):
+                for key in (_FM_UI_LANG_COOKIE, _FM_UI_LANG_COOKIE.upper()):
+                    v = g(key)
+                    if v:
+                        s = str(v).strip().lower()
+                        if s in ("zh", "en"):
+                            return s
+            td = getattr(c, "to_dict", None)
+            if callable(td):
+                for k, v in td().items():
+                    if str(k).lower() == _FM_UI_LANG_COOKIE.lower() and v:
+                        s = str(v).strip().lower()
+                        if s in ("zh", "en"):
+                            return s
+    except Exception:
+        pass
+    if not hasattr(st, "context"):
+        return None
+    h = getattr(st.context, "headers", None)
+    if h is None:
+        return None
+    header_val: str | None = None
+    try:
+        get = getattr(h, "get", None)
+        if callable(get):
+            header_val = get("Cookie") or get("cookie")
+    except Exception:
+        header_val = None
+    if not header_val:
+        try:
+            header_val = h["Cookie"]
+        except Exception:
+            try:
+                header_val = h["cookie"]
+            except Exception:
+                return None
+    if not header_val:
+        return None
+    for part in str(header_val).split(";"):
+        p = part.strip()
+        if not p or "=" not in p:
+            continue
+        name, val = p.split("=", 1)
+        if name.strip().lower() == _FM_UI_LANG_COOKIE.lower():
+            s = unquote(val.strip()).lower()
+            if s in ("zh", "en"):
+                return s
+    return None
+
+
+def _bootstrap_ui_lang() -> None:
+    """首次进入会话时解析界面语言：URL ``lang`` > ``fm_ui_lang`` Cookie > ``FM_UI_LANG`` > 中文。"""
+    if "ui_lang" in st.session_state:
+        return
+    lang = _read_ui_lang_from_query() or _read_ui_lang_cookie_value()
+    if lang is None:
+        env = (os.getenv("FM_UI_LANG") or "").strip().lower()
+        if env in ("en", "zh"):
+            lang = env
+    if lang is None:
+        lang = "zh"
+    st.session_state["ui_lang"] = lang
+
+
+def _persist_ui_lang_cookie_js(lang: str) -> None:
+    """与登录 Cookie 同 Path/Domain/SameSite，刷新后可由服务端读回。"""
+    l = "en" if lang == "en" else "zh"
+    path_lit = json.dumps(_auth_cookie_path())
+    same_site = _auth_cookie_samesite_attr()
+    ss_lit = json.dumps(same_site)
+    domain_lit = _auth_cookie_domain_js_literal()
+    val_lit = json.dumps(l)
+    html = f"""
+<div style="height:1px;width:1px;overflow:hidden"></div>
+<script>
+(function () {{
+  const v = {val_lit};
+  const cookiePath = {path_lit};
+  const domainAttr = {domain_lit};
+  const sameSite = {ss_lit};
+  var secure = "";
+  try {{
+    if (sameSite === "None") {{
+      secure = "; Secure";
+    }} else if (window.location && window.location.protocol === "https:") {{
+      secure = "; Secure";
+    }}
+  }} catch (e0) {{}}
+  const part = "{_FM_UI_LANG_COOKIE}=" + encodeURIComponent(v) + "; Path=" + cookiePath + domainAttr + "; Max-Age=31536000; SameSite=" + sameSite + secure;
+  const apply = function (doc) {{
+    try {{ doc.cookie = part; return true; }} catch (e) {{ return false; }}
+  }};
+  apply(document);
+  try {{
+    if (window.top && window.top !== window) {{ apply(window.top.document); }}
+  }} catch (e1) {{}}
+  try {{
+    if (window.parent && window.parent !== window && window.parent !== window.top) {{
+      apply(window.parent.document);
+    }}
+  }} catch (e2) {{}}
+}})();
+</script>
+"""
+    components.html(html, height=1, width=1)
+
+
+def _persist_ui_lang_preference(lang: str) -> None:
+    """切换语言后：写 session、同步 URL query、写 Cookie（刷新保持）。"""
+    l = "en" if lang == "en" else "zh"
+    st.session_state["ui_lang"] = l
+    try:
+        st.query_params["lang"] = l
+    except Exception:
+        pass
+    _persist_ui_lang_cookie_js(l)
+
+
+def _apply_browser_document_title() -> None:
+    """浏览器标签标题随 ``ui_lang`` 变化（``st.set_page_config`` 仅能设一次，用 JS 覆盖）。"""
+    ttl = t("login_title")
+    ttl_js = json.dumps(ttl)
+    html = f"""
+<div style="height:0;width:0;overflow:hidden"></div>
+<script>
+(function () {{
+  try {{
+    var ttl = {ttl_js};
+    (function (doc) {{ try {{ doc.title = ttl; }} catch (e) {{}} }})(document);
+    try {{ if (window.top && window.top !== window) {{ window.top.document.title = ttl; }} }} catch (e1) {{}}
+  }} catch (e) {{}}
+}})();
+</script>
+"""
+    components.html(html, height=0, width=0)
+
+
 _FM_AUTH_REJECTED_KEY = "_fm_api_auth_rejected"
 
 
@@ -841,9 +996,7 @@ def get_auth_headers() -> dict[str, str]:
 
 
 def render_language_switcher() -> None:
-    if "ui_lang" not in st.session_state:
-        st.session_state["ui_lang"] = "zh"
-    want_en = st.session_state["ui_lang"] == "en"
+    want_en = st.session_state.get("ui_lang", "zh") == "en"
     _, lang_col = st.columns([0.78, 0.22])
     with lang_col:
         if hasattr(st, "toggle"):
@@ -854,7 +1007,7 @@ def render_language_switcher() -> None:
                 help=t("lang_toggle_help"),
             )
             if bool(use_en) != want_en:
-                st.session_state["ui_lang"] = "en" if use_en else "zh"
+                _persist_ui_lang_preference("en" if use_en else "zh")
                 st.rerun()
         else:
             if st.button(
@@ -863,7 +1016,9 @@ def render_language_switcher() -> None:
                 use_container_width=True,
                 help=t("lang_toggle_help"),
             ):
-                st.session_state["ui_lang"] = "en" if st.session_state["ui_lang"] == "zh" else "zh"
+                _persist_ui_lang_preference(
+                    "en" if st.session_state.get("ui_lang", "zh") == "zh" else "zh"
+                )
                 st.rerun()
 
 
@@ -1931,7 +2086,8 @@ def render_sidebar_nav() -> str:
     st.sidebar.divider()
     st.sidebar.caption(t("user_label", name=st.session_state.get("username", "") or "—"))
     if st.sidebar.button(t("logout"), key="fm_logout", use_container_width=True, type="primary"):
-        _pop_auth_rejected_flag()
+        # 须先禁止 Cookie 回填：否则 rerun 后 _restore_auth_cookie_if_needed 可能用未删净的 fm_auth 再次写入 token
+        _reject_auth_cookie_restore()
         _pop_authenticated_session_keys()
         _clear_auth_cookie()
         st.rerun()
@@ -2905,6 +3061,7 @@ def render_overview_panel() -> None:
     st.subheader(t("sub_accounts"))
     acc = data.get("accounts") or []
     if acc:
+        st.caption(t("acc_cap_holdings_total"))
         st.dataframe(prepare_grid_rows(acc), use_container_width=True, hide_index=True)
     else:
         st.info(t("info_no_accounts"))
@@ -3016,6 +3173,7 @@ def render_accounts_panel() -> None:
         items = result.get("data", {}).get("items", [])
         st.subheader(t("sub_account_list"))
         if items:
+            st.caption(t("acc_cap_holdings_total"))
             _consume_accounts_grid_row_pick(items)
             acc_df = pd.DataFrame(prepare_grid_rows(items))
             st.dataframe(
@@ -4187,8 +4345,11 @@ def render_main_workspace(page: str) -> None:
 
 
 def main() -> None:
+    load_dotenv_if_present()
+    env_lang = (os.getenv("FM_UI_LANG") or "").strip().lower()
+    page_title_hint = "Financial Manager" if env_lang == "en" else "理财管理"
     st.set_page_config(
-        page_title="理财管理 · Financial Manager",
+        page_title=page_title_hint,
         layout="wide",
         initial_sidebar_state="expanded",
         menu_items={
@@ -4197,9 +4358,8 @@ def main() -> None:
             "About": None,
         },
     )
-    if "ui_lang" not in st.session_state:
-        st.session_state["ui_lang"] = "zh"
-    load_dotenv_if_present()
+    _bootstrap_ui_lang()
+    _apply_browser_document_title()
     st.session_state["api_base"] = normalize_api_base(read_fm_api_base_raw())
 
     _restore_auth_cookie_if_needed()
